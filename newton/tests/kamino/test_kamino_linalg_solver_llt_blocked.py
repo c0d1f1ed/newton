@@ -52,8 +52,8 @@ class TestLinAlgLLTBlockedSolver(unittest.TestCase):
         self.assertEqual(llt.device, self.default_device)
         self.assertEqual(llt._factorize_block_size, 32)
         self.assertEqual(llt._solve_block_size, 32)
-        self.assertEqual(llt._factorize_block_dim, 128)
-        self.assertEqual(llt._solve_block_dim, 128)
+        self.assertEqual(llt._factorize_block_dim, 1 if getattr(self.default_device, "is_webgpu", False) else 128)
+        self.assertEqual(llt._solve_block_dim, 1 if getattr(self.default_device, "is_webgpu", False) else 128)
 
         split_blocks = LLTBlockedSolver(
             factorize_block_size=64,
@@ -64,8 +64,26 @@ class TestLinAlgLLTBlockedSolver(unittest.TestCase):
         )
         self.assertEqual(split_blocks._factorize_block_size, 64)
         self.assertEqual(split_blocks._solve_block_size, 16)
-        self.assertEqual(split_blocks._factorize_block_dim, 64)
-        self.assertEqual(split_blocks._solve_block_dim, 256)
+        self.assertEqual(
+            split_blocks._factorize_block_dim, 1 if getattr(self.default_device, "is_webgpu", False) else 64
+        )
+        self.assertEqual(split_blocks._solve_block_dim, 1 if getattr(self.default_device, "is_webgpu", False) else 256)
+
+    def test_00_deferred_device_profile(self):
+        """Follow finalization and re-finalization devices for a deferred solver."""
+        with wp.ScopedDevice("cpu"):
+            solver = LLTBlockedSolver(solve_block_dim=64, factorize_block_dim=256)
+        for device in (self.default_device, wp.get_device("cpu")):
+            with self.subTest(device=device), wp.ScopedDevice(device):
+                info = DenseSquareMultiLinearInfo()
+                info.finalize(dimensions=[3], dtype=wp.float32, device=device)
+                matrix = wp.array((np.eye(3, dtype=np.float32) * 4.0).ravel(), device=device)
+                solver.finalize(DenseLinearOperatorData(info=info, mat=matrix))
+                portable = getattr(device, "is_webgpu", False)
+                self.assertEqual(solver._solve_block_dim, 1 if portable else 64)
+                self.assertEqual(solver._factorize_block_dim, 1 if portable else 256)
+                solver.compute(matrix)
+                np.testing.assert_array_equal(np.tril(solver.L.numpy().reshape(3, 3)), np.eye(3) * 2.0)
 
     def test_01_single_problem_dims_all_active(self):
         """

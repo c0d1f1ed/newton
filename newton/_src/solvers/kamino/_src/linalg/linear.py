@@ -597,7 +597,8 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
         """Initialize a blocked Cholesky solver.
 
         The factorization and triangular-solve kernels operate on the same
-        dense ``L`` matrix, but tile their computations independently. Larger
+        dense ``L`` matrix, but tile their computations independently. WebGPU
+        uses one logical lane with portable tile updates. Larger
         factorization tiles reduce the number of sequential panel steps, while
         smaller solve tiles are generally preferable for a single right-hand
         side.
@@ -638,13 +639,10 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
 
         self._factorize_block_size: int = factorize_block_size
         self._solve_block_size: int = solve_block_size
-        self._solve_block_dim: int = solve_block_dim
-        self._factorize_block_dim: int = factorize_block_dim
-
-        # Create the factorization and solve kernels
-        self._factorize_kernel = factorize.make_llt_blocked_factorize_kernel(self._factorize_block_size)
-        self._solve_kernel = factorize.make_llt_blocked_solve_kernel(self._solve_block_size)
-        self._solve_inplace_kernel = factorize.make_llt_blocked_solve_inplace_kernel(self._solve_block_size)
+        self._requested_solve_block_dim = solve_block_dim
+        self._requested_factorize_block_dim = factorize_block_dim
+        self._portable_tile_execution = None
+        self._configure_tile_execution(wp.get_device(device))
 
         # Initialize base class members
         super().__init__(
@@ -677,6 +675,33 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
     # Implementation
     ###
 
+    def _configure_tile_execution(self, device: wp.DeviceLike) -> None:
+        """Follow the effective allocation device, including deferred finalization."""
+        portable_tiles = getattr(device, "is_webgpu", False)
+        if self._portable_tile_execution == portable_tiles:
+            return
+        self._portable_tile_execution = portable_tiles
+        self._solve_block_dim: int = 1 if portable_tiles else self._requested_solve_block_dim
+        self._factorize_block_dim: int = 1 if portable_tiles else self._requested_factorize_block_dim
+
+        # A single logical lane covers every padding entry through the existing
+        # strided loops. Select the existing transpose/matmul algebra rather
+        # than a native C++ update helper on the portable tile backend.
+        if portable_tiles:
+            self._factorize_kernel = factorize.make_llt_blocked_factorize_kernel(
+                self._factorize_block_size, use_native_tile_updates=False
+            )
+            self._solve_kernel = factorize.make_llt_blocked_solve_kernel(
+                self._solve_block_size, use_native_tile_updates=False
+            )
+            self._solve_inplace_kernel = factorize.make_llt_blocked_solve_inplace_kernel(
+                self._solve_block_size, use_native_tile_updates=False
+            )
+        else:
+            self._factorize_kernel = factorize.make_llt_blocked_factorize_kernel(self._factorize_block_size)
+            self._solve_kernel = factorize.make_llt_blocked_solve_kernel(self._solve_block_size)
+            self._solve_inplace_kernel = factorize.make_llt_blocked_solve_inplace_kernel(self._solve_block_size)
+
     @override
     def _allocate_impl(self, A: DenseLinearOperatorData[ScalarType, IndexType], **kwargs: dict[str, Any]) -> None:
         # Check the operator has info
@@ -687,6 +712,9 @@ class LLTBlockedSolver(DirectSolver[ScalarType, IndexType]):
         if not isinstance(A.info, DenseSquareMultiLinearInfo):
             raise ValueError("LLT factorization requires a square matrix.")
 
+        # A deferred solver with device=None follows the current device at
+        # finalization. Re-select only when that effective backend changes.
+        self._configure_tile_execution(wp.get_device(self._device))
         # Allocate the Cholesky factorization matrix and the
         # intermediate result buffer on the specified device
         with wp.ScopedDevice(self._device):

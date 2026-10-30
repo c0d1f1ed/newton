@@ -114,7 +114,7 @@ def shift_failed_llt_factors(
 
 
 @cache
-def make_llt_blocked_factorize_kernel(block_size: int):
+def make_llt_blocked_factorize_kernel(block_size: int, use_native_tile_updates: bool = True):
     @wp.kernel(module="unique", module_options={"enable_backward": False, "default_grid_stride": False})
     def llt_blocked_factorize_kernel(
         # Inputs:
@@ -172,7 +172,7 @@ def make_llt_blocked_factorize_kernel(block_size: int):
             if k > 0:
                 for j in range(0, k, block_size):
                     L_block = wp.tile_load(L_i, shape=(block_size, block_size), offset=(k, j))
-                    if wp.static(HAS_TILE_MATMUL_TRANSPOSE_UPDATE):
+                    if wp.static(use_native_tile_updates and HAS_TILE_MATMUL_TRANSPOSE_UPDATE):
                         wp.tile_matmul_transpose_update(A_kk_tile, L_block, L_block, alpha=-1.0)
                     else:
                         L_block_T = wp.tile_transpose(L_block)
@@ -208,7 +208,7 @@ def make_llt_blocked_factorize_kernel(block_size: int):
                     for j in range(0, k, block_size):
                         L_tile = wp.tile_load(L_i, shape=(block_size, block_size), offset=(i, j))
                         L_2_tile = wp.tile_load(L_i, shape=(block_size, block_size), offset=(k, j))
-                        if wp.static(HAS_TILE_MATMUL_TRANSPOSE_UPDATE):
+                        if wp.static(use_native_tile_updates and HAS_TILE_MATMUL_TRANSPOSE_UPDATE):
                             wp.tile_matmul_transpose_update(A_ik_tile, L_tile, L_2_tile, alpha=-1.0)
                         else:
                             L_T_tile = wp.tile_transpose(L_2_tile)
@@ -226,7 +226,7 @@ def make_llt_blocked_factorize_kernel(block_size: int):
 
 
 @cache
-def make_llt_blocked_solve_func(block_size: int):
+def make_llt_blocked_solve_func(block_size: int, use_native_tile_updates: bool = True):
     """Share the blocked substitutions with callers that fuse RHS preparation."""
 
     @wp.func
@@ -306,9 +306,9 @@ def make_llt_blocked_solve_func(block_size: int):
                 for j in range(i_end, n_i_padded, block_size):
                     L_tile = wp.tile_load(L_i, shape=(block_size, block_size), offset=(j, i))
                     x_tile = wp.tile_load(x_i, shape=(block_size, 1), offset=(j, 0))
-                    if wp.static(HAS_TILE_MATMUL_LEFT_TRANSPOSE_UPDATE):
+                    if wp.static(use_native_tile_updates and HAS_TILE_MATMUL_LEFT_TRANSPOSE_UPDATE):
                         wp.tile_matmul_left_transpose_update(rhs_tile, L_tile, x_tile, alpha=-1.0)
-                    elif wp.static(HAS_NATIVE_TILE_MATMUL_LEFT_TRANSPOSE_UPDATE):
+                    elif wp.static(use_native_tile_updates and HAS_NATIVE_TILE_MATMUL_LEFT_TRANSPOSE_UPDATE):
                         wp.static(make_tile_matmul_left_transpose_update_func(block_size))(
                             rhs_tile, L_tile, x_tile, -1.0
                         )
@@ -323,8 +323,8 @@ def make_llt_blocked_solve_func(block_size: int):
 
 
 @cache
-def make_llt_blocked_solve_kernel(block_size: int):
-    solve = make_llt_blocked_solve_func(block_size)
+def make_llt_blocked_solve_kernel(block_size: int, use_native_tile_updates: bool = True):
+    solve = make_llt_blocked_solve_func(block_size, use_native_tile_updates=use_native_tile_updates)
 
     @wp.kernel(module="unique", module_options={"enable_backward": False, "default_grid_stride": False})
     def llt_blocked_solve_kernel(
@@ -345,8 +345,8 @@ def make_llt_blocked_solve_kernel(block_size: int):
 
 
 @cache
-def make_llt_blocked_solve_inplace_kernel(block_size: int):
-    solve = make_llt_blocked_solve_func(block_size)
+def make_llt_blocked_solve_inplace_kernel(block_size: int, use_native_tile_updates: bool = True):
+    solve = make_llt_blocked_solve_func(block_size, use_native_tile_updates=use_native_tile_updates)
 
     @wp.kernel(module="unique", module_options={"enable_backward": False, "default_grid_stride": False})
     def llt_blocked_solve_inplace_kernel(
