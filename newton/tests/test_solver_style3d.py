@@ -311,8 +311,13 @@ def test_pcg_inner_product_output_views(test, device):
     solver.Ap.assign(a)
     solver.rTz.fill_(-17.0)
     solver.pTAp.fill_(-19.0)
-    solver.step3_update_rTz(2)
-    solver.step6_update_pTAp(3)
+    if getattr(wp.get_device(device), "is_webgpu", False):
+        solver.step3_update_rTz(2)
+        solver.step6_update_pTAp(3)
+    else:
+        with mock.patch.object(wp.array, "__getitem__", side_effect=AssertionError("Native PCG must not create views")):
+            solver.step3_update_rTz(2)
+            solver.step6_update_pTAp(3)
     reference = np.full(5, -17.0, dtype=np.float32)
     reference[2] = expected
     np.testing.assert_array_equal(solver.rTz.numpy(), reference)
@@ -329,6 +334,9 @@ def test_pcg_inner_product_output_views(test, device):
     test.assertEqual(output.dtype, wp.float32)
     test.assertEqual(output.shape, (1,))
     test.assertEqual(output.strides, (8,))
+    parent.fill_(-23.0)
+    array_inner(solver.r, solver.z, strided, index=2)
+    np.testing.assert_array_equal(parent.numpy(), reference)
     solver.r.fill_(wp.vec3(1.0))
     solver.z.fill_(wp.vec3(-2.0))
     solver.step3_update_rTz(2)

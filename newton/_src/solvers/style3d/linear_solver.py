@@ -214,17 +214,18 @@ def array_inner(
     a: wp.array[wp.vec3],
     b: wp.array[wp.vec3],
     out: wp.array[float],
+    index: int = 0,
 ):
-    """Write the Vec3 inner product into an owner-retaining scalar view."""
+    """Write the Vec3 inner product to the selected scalar."""
     if getattr(a.device, "is_webgpu", False):
         # Opaque WebGPU tokens are not CUDA pointers. The array API records
         # the GPU reduction and retains the source/output owners for replay.
-        wp.utils.array_inner(a, b, out=out)
+        wp.utils.array_inner(a, b, out=out[index : index + 1])
         return
 
     from warp._src.context import runtime  # noqa: PLC0415
 
-    out_ptr = out.ptr
+    out_ptr = out.ptr + index * out.strides[0]
     if a.device.is_cpu:
         func = runtime.core.wp_array_inner_float_host
     else:
@@ -299,7 +300,7 @@ class PcgSolver:
         wp.launch(array_mul_kernel, dim=self.dim, inputs=[inv_M, self.r], outputs=[self.z], device=self.device)
 
     def step3_update_rTz(self, iter: int):
-        array_inner(self.r, self.z, self.rTz[iter : iter + 1])
+        array_inner(self.r, self.z, self.rTz, iter)
 
     def step4_update_p(self, iter: int):
         wp.launch(
@@ -334,7 +335,7 @@ class PcgSolver:
             )
 
     def step6_update_pTAp(self, iter: int):
-        array_inner(self.p, self.Ap, self.pTAp[iter : iter + 1])
+        array_inner(self.p, self.Ap, self.pTAp, iter)
 
     def step7_update_x_r(self, x: wp.array[wp.vec3], iter: int):
         wp.launch(
