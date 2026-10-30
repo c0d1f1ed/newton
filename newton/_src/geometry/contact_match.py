@@ -60,8 +60,18 @@ After the match kernel runs, a small finalize kernel reads
 :data:`MATCH_BROKEN`.  Losers are *not* re-matched against a
 second-closest prev (kept for simplicity and speed).
 
-Cost: one ``int64[capacity]`` buffer, one ``wp.atomic_min`` per new
-contact, and one short finalize kernel launch.  No ``atomic_cas``.
+CPU and CUDA use one ``int64[capacity]`` buffer, one ``wp.atomic_min``
+per new contact, and one short finalize kernel launch.
+
+WebGPU preserves the same packed claims with two serialized 32-bit reduction
+passes. The candidate pass also records distance bits and snapshots the
+previous signed high words. The first reduction minimizes signed high words,
+resetting a stale unsigned low word only when the high word improves. The
+second minimizes unsigned low words among final high-word winners and publishes
+the complete packed claim before the unchanged finalize pass. All resets
+precede low-word reductions, and all publication precedes resolution, so no
+lock or partially observed packed claim is required. Existing claims and
+duplicate-key resolution retain the native behavior.
 
 Persistent storage
 ------------------
@@ -73,6 +83,8 @@ sorting and matching (for example a pass that compacts the sorted stream) may
 reuse that scratch without corrupting the history.  Sticky mode adds the
 body-frame points and offsets (48 bytes/contact) and replays the owned normal.
 The optional contact report adds one ``int32`` flag per contact.
+WebGPU adds two preallocated 32-bit scratch words per contact; its typed views
+alias the existing claim and distance allocations and retain their owners.
 
 Per-frame call order (inside :class:`~newton.CollisionPipeline`)::
 
@@ -122,6 +134,8 @@ _GENERATION_SENTINEL = wp.constant(wp.int32(-1))
 # any packed (flipped_dist << 32 | key_low32) any kernel will ever
 # produce, so the first ``atomic_min`` always wins.
 _CLAIM_SENTINEL = wp.constant(wp.int64(0x7FFFFFFFFFFFFFFF))
+_CLAIM_LOW_SENTINEL = wp.constant(wp.uint32(0xFFFFFFFF))
+_CLAIM_SIGN_BIT = wp.constant(wp.uint32(0x80000000))
 
 
 @wp.kernel(enable_backward=False)
@@ -266,12 +280,9 @@ class _MatchData:
     pair_key_stride: wp.int64
 
 
-@wp.kernel(enable_backward=False)
-def _match_contacts_kernel(data: _MatchData):
-    """Pass 1: pick each new contact's closest prev candidate and stake
-    a packed claim on it via ``wp.atomic_min``.
-    """
-    tid = wp.tid()
+@wp.func
+def _match_contact_candidate(data: _MatchData, tid: int) -> tuple[int, float]:
+    """Select the closest eligible previous contact using the common matching rules."""
     if tid == 0:
         # Previous-frame indices name rows of this buffer only if it wrote that frame.
         if data.prev_frame[0] == data.buffer_id:
@@ -281,12 +292,12 @@ def _match_contacts_kernel(data: _MatchData):
     n_new = data.new_count[0]
     if tid >= n_new:
         data.match_index[tid] = MATCH_NOT_FOUND
-        return
+        return int(-1), float(0.0)
 
     n_old = data.prev_count[0]
     if n_old == 0:
         data.match_index[tid] = MATCH_NOT_FOUND
-        return
+        return int(-1), float(0.0)
 
     shape0 = data.new_shape0[tid]
     shape1 = data.new_shape1[tid]
@@ -294,7 +305,7 @@ def _match_contacts_kernel(data: _MatchData):
         data.shape_world[shape1], data.reset_world_mask, data.world_count
     ):
         data.match_index[tid] = MATCH_NOT_FOUND
-        return
+        return int(-1), float(0.0)
 
     target_key = data.new_keys[tid]
 
@@ -333,7 +344,7 @@ def _match_contacts_kernel(data: _MatchData):
 
     if range_lo >= range_hi:
         data.match_index[tid] = MATCH_NOT_FOUND
-        return
+        return int(-1), float(0.0)
 
     # Closest-point match within the pair range, gated by normal dot.
     best_idx = int(-1)
@@ -352,15 +363,86 @@ def _match_contacts_kernel(data: _MatchData):
 
     if best_idx >= 0:
         data.match_index[tid] = wp.int32(best_idx)
-        # Race for ownership of prev[best_idx] with a single atomic_min.
-        # Closest distance wins; ties resolved by smallest sort_key low
-        # 32 bits.  Using the sort key (instead of ``tid``) keeps the
-        # winner invariant under the non-deterministic unsorted slot
-        # assignment that the narrow phase gives us via ``wp.atomic_add``.
-        wp.atomic_min(data.prev_claim, best_idx, _pack_claim(best_dist_sq, target_key))
     else:
-        # Pair range exists but no contact within thresholds.
         data.match_index[tid] = MATCH_BROKEN
+    return best_idx, best_dist_sq
+
+
+@wp.kernel(enable_backward=False)
+def _match_contacts_kernel(data: _MatchData):
+    """Pick each contact's candidate and retain the native packed claim operation."""
+    tid = wp.tid()
+    best_idx, best_dist_sq = _match_contact_candidate(data, tid)
+    if best_idx >= 0:
+        wp.atomic_min(data.prev_claim, best_idx, _pack_claim(best_dist_sq, data.new_keys[tid]))
+
+
+@wp.kernel(enable_backward=False)
+def _match_contacts_split_kernel(
+    data: _MatchData,
+    claim_distance: wp.array[wp.float32],
+    prev_high: wp.array[wp.int32],
+    minimum_high: wp.array[wp.int32],
+):
+    """Select candidates and snapshot existing high words before the reduction passes."""
+    tid = wp.tid()
+    if tid < data.prev_count[0]:
+        minimum_high[tid] = prev_high[tid]
+    best_idx, best_dist_sq = _match_contact_candidate(data, tid)
+    if best_idx >= 0:
+        claim_distance[tid] = best_dist_sq
+
+
+@wp.func
+def _flipped_claim_high(bits: wp.uint32) -> wp.int32:
+    """Encode the exact Float32 bits as the signed high word of a packed claim."""
+    mask = wp.uint32(-wp.int32(bits >> wp.uint32(31))) | _CLAIM_SIGN_BIT
+    return wp.int32(bits ^ mask)
+
+
+@wp.kernel(enable_backward=False)
+def _reduce_claim_high_kernel(
+    match_index: wp.array[wp.int32],
+    claim_bits: wp.array[wp.uint32],
+    minimum_high: wp.array[wp.int32],
+    prev_low: wp.array[wp.uint32],
+    new_count: wp.array[wp.int32],
+):
+    """Reduce signed high words and discard stale low words only when the high improves."""
+    tid = wp.tid()
+    if tid >= new_count[0]:
+        return
+    candidate = match_index[tid]
+    if candidate < 0:
+        return
+    high = _flipped_claim_high(claim_bits[tid])
+    previous = wp.atomic_min(minimum_high, candidate, high)
+    if high < previous:
+        # All resets precede the low-word pass, so simultaneous resets agree.
+        wp.atomic_exch(prev_low, candidate, _CLAIM_LOW_SENTINEL)
+
+
+@wp.kernel(enable_backward=False)
+def _reduce_claim_low_kernel(
+    match_index: wp.array[wp.int32],
+    sort_keys: wp.array[wp.int64],
+    claim_bits: wp.array[wp.uint32],
+    minimum_high: wp.array[wp.int32],
+    prev_high: wp.array[wp.int32],
+    prev_low: wp.array[wp.uint32],
+    new_count: wp.array[wp.int32],
+):
+    """Reduce unsigned tie keys among winning high words and publish the complete claim."""
+    tid = wp.tid()
+    if tid >= new_count[0]:
+        return
+    candidate = match_index[tid]
+    if candidate < 0:
+        return
+    high = _flipped_claim_high(claim_bits[tid])
+    if high == minimum_high[candidate]:
+        wp.atomic_min(prev_low, candidate, wp.uint32(sort_keys[tid]))
+        wp.atomic_exch(prev_high, candidate, high)
 
 
 @wp.kernel(enable_backward=False)
@@ -722,6 +804,14 @@ class ContactMatcher:
             # each active slot for the next frame; initialize the allocation for
             # the first frame before any state has been saved.
             self._prev_claim = wp.full(capacity, _CLAIM_SENTINEL, dtype=wp.int64)
+            self._use_split_claims = False
+            self._claim_distance = None
+            self._claim_bits = None
+            self._claim_high = None
+            self._claim_low = None
+            self._minimum_claim_high = None
+            if getattr(self._prev_claim.device, "is_webgpu", False):
+                self._initialize_split_claims()
 
             # Contact report (optional).
             self._has_report = contact_report
@@ -747,6 +837,30 @@ class ContactMatcher:
                 self._prev_point1 = None
                 self._prev_offset0 = None
                 self._prev_offset1 = None
+
+    def _initialize_split_claims(self) -> None:
+        """Preallocate split claim storage and keep all typed aliases owned."""
+        device = self._prev_claim.device
+        self._claim_distance = wp.empty(self._capacity, dtype=wp.float32, device=device)
+        self._minimum_claim_high = wp.empty(self._capacity, dtype=wp.int32, device=device)
+        if self._capacity:
+            self._claim_bits = wp.array(
+                ptr=self._claim_distance.ptr, shape=self._capacity, dtype=wp.uint32, device=device
+            )
+            self._claim_bits._ref = self._claim_distance
+            self._claim_low = wp.array(
+                ptr=self._prev_claim.ptr, shape=self._capacity, strides=(8,), dtype=wp.uint32, device=device
+            )
+            self._claim_high = wp.array(
+                ptr=self._prev_claim.ptr + 4, shape=self._capacity, strides=(8,), dtype=wp.int32, device=device
+            )
+            self._claim_low._ref = self._prev_claim
+            self._claim_high._ref = self._prev_claim
+        else:
+            self._claim_bits = wp.empty(0, dtype=wp.uint32, device=device)
+            self._claim_low = wp.empty(0, dtype=wp.uint32, device=device)
+            self._claim_high = wp.empty(0, dtype=wp.int32, device=device)
+        self._use_split_claims = True
 
     # ------------------------------------------------------------------
     # Properties
@@ -885,7 +999,35 @@ class ContactMatcher:
         data.pair_sub_key_mask = self._pair_sub_key_mask
         data.pair_key_stride = self._pair_key_stride
 
-        wp.launch(_match_contacts_kernel, dim=self._capacity, inputs=[data], device=device)
+        if self._use_split_claims:
+            wp.launch(
+                _match_contacts_split_kernel,
+                dim=self._capacity,
+                inputs=[data, self._claim_distance, self._claim_high, self._minimum_claim_high],
+                device=device,
+            )
+            wp.launch(
+                _reduce_claim_high_kernel,
+                dim=self._capacity,
+                inputs=[match_index_out, self._claim_bits, self._minimum_claim_high, self._claim_low, contact_count],
+                device=device,
+            )
+            wp.launch(
+                _reduce_claim_low_kernel,
+                dim=self._capacity,
+                inputs=[
+                    match_index_out,
+                    sort_keys,
+                    self._claim_bits,
+                    self._minimum_claim_high,
+                    self._claim_high,
+                    self._claim_low,
+                    contact_count,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(_match_contacts_kernel, dim=self._capacity, inputs=[data], device=device)
         wp.launch(
             _resolve_claims_kernel,
             dim=self._capacity,

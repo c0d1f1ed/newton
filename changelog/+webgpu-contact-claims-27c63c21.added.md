@@ -1,0 +1,1 @@
+Preserve frame-to-frame contact matching on WebGPU with exact signed-high and unsigned-low claim reductions, retaining deterministic tie keys, existing claim state, sticky contacts, and reports without 64-bit atomics.

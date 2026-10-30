@@ -10,7 +10,16 @@ import warp as wp
 
 import newton
 from newton._src.geometry.contact_data import CONTACT_SORT_CONVEX_SUB_KEY_BITS, CONTACT_SORT_SUB_KEY_BITS
-from newton._src.geometry.contact_match import _CLAIM_SENTINEL, MATCH_BROKEN, MATCH_NOT_FOUND
+from newton._src.geometry.contact_match import (
+    _CLAIM_SENTINEL,
+    MATCH_BROKEN,
+    MATCH_NOT_FOUND,
+    ContactMatcher,
+    _pack_claim,
+    _reduce_claim_high_kernel,
+    _reduce_claim_low_kernel,
+    _resolve_claims_kernel,
+)
 from newton._src.geometry.contact_sort import ContactSorter
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
@@ -21,6 +30,25 @@ class TestContactMatching(unittest.TestCase):
 
 class TestContactMatchingSticky(unittest.TestCase):
     pass
+
+
+@wp.kernel(enable_backward=False)
+def _copy_claim_high_words(source: wp.array[wp.int32], destination: wp.array[wp.int32]):
+    index = wp.tid()
+    destination[index] = source[index]
+
+
+@wp.kernel(enable_backward=False)
+def _native_claim_reference(
+    distances: wp.array[wp.float32],
+    keys: wp.array[wp.int64],
+    candidates: wp.array[wp.int32],
+    count: wp.array[wp.int32],
+    claims: wp.array[wp.int64],
+):
+    index = wp.tid()
+    if index < count[0] and candidates[index] >= 0:
+        wp.atomic_min(claims, candidates[index], _pack_claim(distances[index], keys[index]))
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +162,8 @@ def test_stable_scene_identity_across_three_frames(test, device):
 
         _collide_once(pipeline, state, contacts)  # frame 1
         for frame in range(2, 5):
+            if frame == 3 and not pipeline._contact_matcher._use_split_claims:
+                pipeline._contact_matcher._initialize_split_claims()
             count = _collide_once(pipeline, state, contacts)
             match_idx = contacts.rigid_contact_match_index.numpy()[:count]
             expected = np.arange(count, dtype=np.int32)
@@ -142,6 +172,162 @@ def test_stable_scene_identity_across_three_frames(test, device):
                 expected,
                 err_msg=f"Frame {frame}: match_index must be identity",
             )
+
+
+def test_split_claims_exact_words(test, device):
+    """Reproduce packed claim minima, persistent contenders, and captured replay with split words.
+
+    Negative values and NaNs exercise only the bit encoder here; the matching
+    distance/threshold checks do not admit them as candidate distances.
+    """
+    device = wp.get_device(device)
+    capacity = 32
+    matcher = ContactMatcher(
+        capacity,
+        sorter=ContactSorter(capacity, allocate_simple_scratch=False, device=device),
+        shape_world=wp.array([-1], dtype=wp.int32, device=device),
+        world_count=0,
+        shape_index_bits=20,
+        sub_key_bits=24,
+        device=device,
+    )
+    if not matcher._use_split_claims:
+        matcher._initialize_split_claims()
+    test.assertIs(matcher._claim_bits._ref, matcher._claim_distance)
+    test.assertIs(matcher._claim_high._ref, matcher._prev_claim)
+    test.assertIs(matcher._claim_low._ref, matcher._prev_claim)
+
+    bits = np.array(
+        [
+            0x3F800000,
+            0x3E800000,
+            0x3E800000,
+            0x80000000,
+            0,
+            0,
+            0xBF800000,
+            0xFF800000,
+            0x7F800000,
+            0x7FC00001,
+            0x3F000000,
+            0x3E000000,
+            0x3F800000,
+            0x3E800000,
+        ],
+        dtype=np.uint32,
+    )
+    keys = np.array(
+        [0, 0xFFFFFFFF, 9, 0xFFFFFFFF, 0xFFFFFFFF, 1, 0xFFFFFFFF, 3, 0x80000000, 0, 0, 0xFFFFFFFF, 77, 77],
+        dtype=np.int64,
+    )
+    candidates = np.array([0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], dtype=np.int32)
+    input_bits = np.zeros(capacity, dtype=np.uint32)
+    input_bits[: len(bits)] = bits
+    input_keys = np.zeros(capacity, dtype=np.int64)
+    input_keys[: len(keys)] = keys
+    input_candidates = np.full(capacity, MATCH_NOT_FOUND, dtype=np.int32)
+    input_candidates[: len(candidates)] = candidates
+    input_candidates[len(candidates) + 1] = MATCH_BROKEN
+    matcher._claim_bits.assign(input_bits)
+    key_array = wp.array(input_keys, dtype=wp.int64, device=device)
+    candidate_array = wp.array(input_candidates, dtype=wp.int32, device=device)
+    count = wp.zeros(1, dtype=wp.int32, device=device)
+    report = wp.zeros(capacity, dtype=wp.int32, device=device)
+    native_claims = wp.full(capacity, _CLAIM_SENTINEL, dtype=wp.int64, device=device)
+
+    def reduce_claims():
+        wp.launch(
+            _copy_claim_high_words,
+            dim=capacity,
+            inputs=[matcher._claim_high, matcher._minimum_claim_high],
+            device=device,
+        )
+        wp.launch(
+            _reduce_claim_high_kernel,
+            dim=capacity,
+            inputs=[candidate_array, matcher._claim_bits, matcher._minimum_claim_high, matcher._claim_low, count],
+            device=device,
+        )
+        wp.launch(
+            _reduce_claim_low_kernel,
+            dim=capacity,
+            inputs=[
+                candidate_array,
+                key_array,
+                matcher._claim_bits,
+                matcher._minimum_claim_high,
+                matcher._claim_high,
+                matcher._claim_low,
+                count,
+            ],
+            device=device,
+        )
+
+    mask = np.where(input_bits >> np.uint32(31), np.uint32(0xFFFFFFFF), np.uint32(0x80000000))
+    packed = ((input_bits ^ mask).astype(np.uint64) << np.uint64(32)) | input_keys.astype(np.uint64)
+    packed = packed.view(np.int64)
+    capture_supported = getattr(device, "is_graph_capture_supported", device.is_cuda)
+    modes = (False, True) if capture_supported else (False,)
+    for capture in modes:
+        with test.subTest(capture=capture):
+            matcher._prev_claim.fill_(_CLAIM_SENTINEL)
+            native_claims.fill_(_CLAIM_SENTINEL)
+            candidate_array.assign(input_candidates)
+            count.zero_()
+            expected = np.full(capacity, int(_CLAIM_SENTINEL), dtype=np.int64)
+            graph = None
+            if capture:
+                with wp.ScopedCapture(device=device) as captured:
+                    reduce_claims()
+                graph = captured.graph
+            # Growing counts also replace an earlier claim with a smaller high
+            # word whose low word is larger, exposing stale-low-word errors.
+            for active in (1, 6, len(bits), capacity, capacity):
+                count.fill_(active)
+                if graph is None:
+                    reduce_claims()
+                else:
+                    wp.capture_launch(graph)
+                for index in range(active):
+                    slot = input_candidates[index]
+                    if slot >= 0:
+                        expected[slot] = min(expected[slot], packed[index])
+                np.testing.assert_array_equal(matcher._prev_claim.numpy(), expected)
+                if not getattr(device, "is_webgpu", False):
+                    wp.launch(
+                        _native_claim_reference,
+                        dim=capacity,
+                        inputs=[matcher._claim_distance, key_array, candidate_array, count, native_claims],
+                        device=device,
+                    )
+                    np.testing.assert_array_equal(native_claims.numpy(), expected)
+            wp.launch(
+                _resolve_claims_kernel,
+                dim=capacity,
+                inputs=[candidate_array, key_array, matcher._prev_claim, report, count, 1],
+                device=device,
+            )
+            resolved = input_candidates.copy()
+            for index, slot in enumerate(candidates):
+                if (expected.view(np.uint64)[slot] & np.uint64(0xFFFFFFFF)) != np.uint64(keys[index]):
+                    resolved[index] = MATCH_BROKEN
+            np.testing.assert_array_equal(candidate_array.numpy(), resolved)
+            # Duplicate low keys preserve the original resolver's shared caveat.
+            np.testing.assert_array_equal(candidate_array.numpy()[12:14], [5, 5])
+
+    empty = ContactMatcher(
+        0,
+        sorter=ContactSorter(0, allocate_simple_scratch=False, device=device),
+        shape_world=wp.array([-1], dtype=wp.int32, device=device),
+        world_count=0,
+        shape_index_bits=20,
+        sub_key_bits=24,
+        device=device,
+    )
+    if not empty._use_split_claims:
+        empty._initialize_split_claims()
+    test.assertEqual(empty._claim_high.size, 0)
+    test.assertEqual(empty._claim_low.size, 0)
 
 
 def test_save_initializes_next_frame_claims(test, device):
@@ -175,6 +361,8 @@ def test_masked_reset_restarts_only_selected_contact_history(test, device):
             contacts.rigid_contact_match_index.numpy()[:count],
             np.arange(count, dtype=np.int32),
         )
+        if not pipeline._contact_matcher._use_split_claims:
+            pipeline._contact_matcher._initialize_split_claims()
 
         pipeline.reset_contact_matching(wp.array((False, False, False), dtype=wp.bool, device=device))
         _collide_once(pipeline, state, contacts)
@@ -944,6 +1132,8 @@ def test_sticky_matched_rows_replayed(test, device):
         model, state = _build_simple_scene(device)
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky")
         contacts = pipeline.contacts()
+        if not pipeline._contact_matcher._use_split_claims:
+            pipeline._contact_matcher._initialize_split_claims()
 
         count1 = _collide_once(pipeline, state, contacts)
         test.assertGreater(count1, 0)
@@ -1227,6 +1417,7 @@ cuda_devices = get_cuda_test_devices()
 add_function_test(
     TestContactMatching, "test_first_frame_all_not_found", test_first_frame_all_not_found, devices=devices
 )
+add_function_test(TestContactMatching, "test_split_claims_exact_words", test_split_claims_exact_words, devices=devices)
 add_function_test(
     TestContactMatching, "test_stable_scene_identity_match", test_stable_scene_identity_match, devices=devices
 )
