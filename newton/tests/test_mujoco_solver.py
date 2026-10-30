@@ -13847,13 +13847,13 @@ def _large_nv_mjcf(cone: str) -> str:
 
 class TestMuJoCoLinesearchBlockDim(unittest.TestCase):
     def test_linesearch_block_dim_is_left_to_mujoco_warp(self):
-        """Leave MuJoCo Warp's line-search block dimension untouched.
+        """Preserve native block dimensions and select the WebGPU reduction profile.
 
         Newton forced ``linesearch_iterative = 32`` after ``put_model()`` to work
         around a CUDA registers-per-block failure that MuJoCo Warp has since capped
-        upstream. Upstream only assigns the field when ``nv > 500``, so a model over
-        that threshold is the only one whose value differs from the default and
-        therefore the only one that can detect the override coming back.
+        upstream. Native devices must retain that provider choice, including the
+        ``nv > 500`` special case. WebGPU uses one invocation for the line-search
+        and conjugate-gradient kernels that stride over every row or DOF.
         """
         try:
             _, mujoco_warp = SolverMuJoCo.import_mujoco()
@@ -13867,8 +13867,20 @@ class TestMuJoCoLinesearchBlockDim(unittest.TestCase):
         self.assertGreater(solver.mj_model.nv, 500)
         # Compare against upstream's own choice rather than a hard-coded 256, so the
         # test keeps its meaning if MuJoCo Warp retunes the value.
-        expected = mujoco_warp.put_model(solver.mj_model).block_dim.linesearch_iterative
-        self.assertEqual(solver.mjw_model.block_dim.linesearch_iterative, expected)
+        provider_defaults = mujoco_warp.put_model(solver.mj_model).block_dim
+        portable_fields = (
+            "linesearch_iterative",
+            "update_gradient_grad",
+            "solve_init_search_cg",
+            "solve_beta_accumulate",
+            "solve_search_update_cg",
+            "contact_jac_tiled",
+        )
+        is_webgpu = getattr(solver.model.device, "is_webgpu", False)
+        for field in portable_fields:
+            with self.subTest(field=field):
+                expected = 1 if is_webgpu else getattr(provider_defaults, field)
+                self.assertEqual(getattr(solver.mjw_model.block_dim, field), expected)
 
     def test_large_elliptic_model_steps_on_cuda(self):
         """Step a large elliptic-cone model on CUDA without a kernel-launch failure.

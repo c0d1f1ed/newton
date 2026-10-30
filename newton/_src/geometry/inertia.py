@@ -505,6 +505,7 @@ def compute_inertia_mesh(
 
     wp_vertices = wp.array(vertices, dtype=wp.vec3)
     wp_indices = wp.array(indices, dtype=int)
+    block_dim = 1 if getattr(wp_vertices.device, "is_webgpu", False) else _MESH_INERTIA_TILE_SIZE
 
     if is_solid:
         wp.launch_tiled(
@@ -520,7 +521,7 @@ def compute_inertia_mesh(
                 com_warp,
                 I_warp,
             ],
-            block_dim=_MESH_INERTIA_TILE_SIZE,
+            block_dim=block_dim,
         )
     else:
         if isinstance(thickness, float):
@@ -539,7 +540,7 @@ def compute_inertia_mesh(
                 com_warp,
                 I_warp,
             ],
-            block_dim=_MESH_INERTIA_TILE_SIZE,
+            block_dim=block_dim,
         )
 
     V_tot = float(vol_warp.numpy()[0])  # signed volume

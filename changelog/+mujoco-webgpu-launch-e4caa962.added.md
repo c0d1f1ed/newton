@@ -1,0 +1,1 @@
+Select single-invocation launches for MuJoCo Warp's strided solver reductions and complete contact-Jacobian partitions, and for mesh inertia integration, on WebGPU while retaining CPU and CUDA defaults.

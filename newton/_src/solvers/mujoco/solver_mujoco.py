@@ -9014,6 +9014,19 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 # the authoring policy on the CPU model for inspection and MJCF export.
                 self.mj_model.tree_sleep_policy[:] = sleep_policies
 
+            if getattr(model.device, "is_webgpu", False):
+                # These kernels stride over every row or DOF using the runtime
+                # block width before reducing lane contributions. One invocation
+                # preserves complete traversal without distributed lane storage.
+                self.mjw_model.block_dim.linesearch_iterative = 1
+                self.mjw_model.block_dim.update_gradient_grad = 1
+                self.mjw_model.block_dim.solve_init_search_cg = 1
+                self.mjw_model.block_dim.solve_beta_accumulate = 1
+                self.mjw_model.block_dim.solve_search_update_cg = 1
+                # This field also partitions Jacobian columns. The provider
+                # recomputes the block count, retaining every DOF/contact row.
+                self.mjw_model.block_dim.contact_jac_tiled = 1
+
             # MuJoCo-Warp 3.15 folds actuator damping into DOF/tendon damping.
             # Keep that construction-time contribution when publishing Newton's
             # per-world passive properties. Native MuJoCo applies it separately.
