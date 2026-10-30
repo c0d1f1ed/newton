@@ -3876,6 +3876,9 @@ add_function_test(
 
 
 def test_mesh_convex_midphase_queries_margin_shell(test, device):
+    """Retain contact candidates in the margin shell with tiled and scalar BVH queries."""
+    from newton._src.geometry.narrow_phase import _create_find_mesh_triangle_overlaps_kernel  # noqa: PLC0415
+
     margin = 0.02
     gap = 0.005
     radius = 0.1
@@ -3908,9 +3911,22 @@ def test_mesh_convex_midphase_queries_margin_shell(test, device):
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
-
     contact_count = int(contacts.rigid_contact_count.numpy()[0])
     test.assertGreater(contact_count, 0)
+
+    # Run the scalar query on native devices too, using the same physical model
+    # and contact thresholds. WebGPU selects this path automatically.
+    pipeline.narrow_phase._mesh_midphase_kernel = _create_find_mesh_triangle_overlaps_kernel(
+        0, use_tile_bvh_query=False
+    )
+    pipeline.narrow_phase.tile_size_mesh_convex = 1
+    pipeline.narrow_phase._midphase_narrow_kernel = None
+    pipeline.collide(state, contacts)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), contact_count)
+    triangle_count = int(pipeline.narrow_phase.triangle_pairs_count.numpy()[0])
+    triangle_pairs = pipeline.narrow_phase.triangle_pairs.numpy()[:triangle_count]
+    test.assertEqual(triangle_count, 2)
+    np.testing.assert_array_equal(np.sort(triangle_pairs[:, 2]), [0, 1])
 
 
 def test_rigid_mesh_contacts_export_surface_velocity(test, device):
@@ -5270,7 +5286,7 @@ def test_mesh_query_tile_width_follows_geometry(test, device):
     heightfield_model = heightfield_builder.finalize(device=device)
     heightfield_pipeline = newton.CollisionPipeline(heightfield_model, broad_phase="nxn")
 
-    if wp.get_device(device).is_cpu:
+    if wp.get_device(device).is_cpu or getattr(wp.get_device(device), "is_webgpu", False):
         test.assertEqual(mesh_pipeline.narrow_phase.tile_size_mesh_convex, 1)
         test.assertEqual(heightfield_pipeline.narrow_phase.tile_size_mesh_convex, 1)
     else:
@@ -5290,7 +5306,7 @@ add_function_test(
     TestMeshConvexMidphase,
     "test_mesh_convex_midphase_queries_margin_shell",
     test_mesh_convex_midphase_queries_margin_shell,
-    devices=get_cuda_test_devices(),
+    devices=get_test_devices(),
     check_output=False,
 )
 

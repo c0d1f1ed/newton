@@ -202,7 +202,7 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(*camera_target) + wp.vec3(0.12, -0.03, 0.06), pitch=-26.0, yaw=166.0)
 
         self.graph = None
-        if wp.get_device().is_cuda and not args.no_graph:
+        if newton.examples._can_capture_gpu(wp.get_device()) and not args.no_graph:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph

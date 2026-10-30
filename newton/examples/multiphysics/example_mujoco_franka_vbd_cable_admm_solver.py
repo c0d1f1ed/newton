@@ -151,7 +151,7 @@ class Example:
         builder.color()
         self.model = builder.finalize()
         self.device = self.model.device
-        self.use_graph = self.use_graph and self.device.is_cuda
+        self.use_graph = self.use_graph and newton.examples._can_capture_gpu(self.device)
         self._count_admm_shape_pairs_per_world()
 
         mujoco_contact_budget = max(64, 16 * self.world_count)

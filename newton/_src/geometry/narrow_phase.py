@@ -22,6 +22,7 @@ from ..geometry.collision_core import (
     create_find_contacts,
     get_triangle_shape_from_mesh,
     mesh_vs_convex_midphase,
+    mesh_vs_convex_midphase_scalar,
     post_process_axial_on_discrete_contact,
     post_process_minkowski_only,
 )
@@ -1826,7 +1827,7 @@ def compute_shape_interior_points_kernel(
     shape_interior_point[shape] = point
 
 
-def _create_find_mesh_triangle_overlaps_kernel(narrow_ratio: int):
+def _create_find_mesh_triangle_overlaps_kernel(narrow_ratio: int, use_tile_bvh_query: bool = True):
     """Create the mesh/heightfield-vs-convex midphase kernel.
 
     The wide kernel (``narrow_ratio == 0``) runs a tile block per query while
@@ -1835,7 +1836,12 @@ def _create_find_mesh_triangle_overlaps_kernel(narrow_ratio: int):
     ``narrow_ratio`` times as many one-warp blocks runs instead.
     """
 
-    @wp.kernel(enable_backward=False, module=f"narrow_phase_mesh_overlaps_{narrow_ratio}")
+    query_mesh = mesh_vs_convex_midphase if use_tile_bvh_query else mesh_vs_convex_midphase_scalar
+    module_name = f"narrow_phase_mesh_overlaps_{narrow_ratio}"
+    if not use_tile_bvh_query:
+        module_name += "_scalar"
+
+    @wp.kernel(enable_backward=False, module=module_name)
     def narrow_phase_find_mesh_triangle_overlaps_kernel(
         shape_types: wp.array[int],
         shape_transform: wp.array[wp.transform],
@@ -1867,13 +1873,14 @@ def _create_find_mesh_triangle_overlaps_kernel(narrow_ratio: int):
         tid, j = wp.tid()
 
         num_mesh_pairs = shape_pairs_mesh_count[0]
-        if wp.static(narrow_ratio == 0):
-            # The wide GPU launch gives each query a block; past one query per
-            # block, the narrow launch takes over all of them.
-            if wp.block_dim() > _MIDPHASE_NARROW_TILE_SIZE and num_mesh_pairs > total_num_threads:
+        if wp.static(use_tile_bvh_query):
+            if wp.static(narrow_ratio == 0):
+                # The wide GPU launch gives each query a block; past one query per
+                # block, the narrow launch takes over all of them.
+                if wp.block_dim() > _MIDPHASE_NARROW_TILE_SIZE and num_mesh_pairs > total_num_threads:
+                    return
+            elif num_mesh_pairs <= total_num_threads // narrow_ratio:
                 return
-        elif num_mesh_pairs <= total_num_threads // narrow_ratio:
-            return
 
         # Strided loop over mesh pairs
         for i in range(tid, num_mesh_pairs, total_num_threads):
@@ -1947,7 +1954,7 @@ def _create_find_mesh_triangle_overlaps_kernel(narrow_ratio: int):
             contact_threshold = gap_sum + margin_non_mesh + margin_mesh
 
             # Call mesh_vs_convex_midphase with the shape_data and pair contact threshold.
-            mesh_vs_convex_midphase(
+            query_mesh(
                 j,
                 mesh_shape,
                 non_mesh_shape,
@@ -2760,7 +2767,15 @@ class NarrowPhase:
         # and kernel-side ``wp.block_dim()`` in sync on CPU.
         # Dense mesh queries benefit from wider cooperative result batches;
         # heightfields only use lane zero and retain the leaner launch.
-        self.tile_size_mesh_convex = 1 if device_obj.is_cpu else (128 if has_heightfields else 256)
+        self._use_tile_bvh_query = not getattr(device_obj, "is_webgpu", False)
+        self.tile_size_mesh_convex = (
+            1 if device_obj.is_cpu or not self._use_tile_bvh_query else (128 if has_heightfields else 256)
+        )
+        self._mesh_midphase_kernel = (
+            narrow_phase_find_mesh_triangle_overlaps_kernel
+            if self._use_tile_bvh_query
+            else _create_find_mesh_triangle_overlaps_kernel(0, use_tile_bvh_query=False)
+        )
         # Must match ``MESH_SDF_BLOCK_DIM`` in sdf_contact.py: the mesh-SDF
         # kernels assume ``wp.block_dim()`` equals that constant so the
         # tile-stack overflow margin (``STACK_CAPACITY = 2 *
@@ -3554,7 +3569,7 @@ class NarrowPhase:
                     self.total_num_threads,
                 ]
             else:
-                midphase_kernel = narrow_phase_find_mesh_triangle_overlaps_kernel
+                midphase_kernel = self._mesh_midphase_kernel
                 midphase_dim = [self.num_tile_blocks, self.tile_size_mesh_convex]
                 midphase_inputs = [
                     shape_types,

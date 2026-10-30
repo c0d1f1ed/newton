@@ -101,7 +101,8 @@ def test_tiled_local_bounds_rebuild(test: TestShapeBvhBounds, device: str):
         call for call in launch_tiled.call_args_list if call.kwargs.get("kernel") is compute_shape_local_bounds
     ]
     test.assertEqual(len(local_bounds_launches), 1)
-    test.assertEqual(local_bounds_launches[0].kwargs["block_dim"], SHAPE_BOUNDS_BLOCK_DIM)
+    expected_block_dim = 1 if getattr(wp.get_device(device), "is_webgpu", False) else SHAPE_BOUNDS_BLOCK_DIM
+    test.assertEqual(local_bounds_launches[0].kwargs["block_dim"], expected_block_dim)
 
     changed_vertices = vertices.copy()
     changed_vertices[num_points // 3] = (-8.0, 9.0, -10.0)

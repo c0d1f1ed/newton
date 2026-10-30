@@ -142,7 +142,7 @@ class Example:
 
     def capture(self):
         self.graph = None
-        if wp.get_device().is_cuda and self.solver.grid_type == "fixed":
+        if newton.examples._can_capture_gpu(wp.get_device()) and self.solver.grid_type == "fixed":
             if self.sim_substeps % 2 != 0:
                 warnings.warn("Sim substeps must be even for graph capture of MPM step", stacklevel=2)
             else:

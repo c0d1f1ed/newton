@@ -826,7 +826,7 @@ class Example:
         # An odd substep count ends a frame on the other state buffer, so it
         # alternates between two graphs, one starting from each buffer.
         self.graphs = []
-        if self.model.device.is_cuda and not wp.config.verify_cuda:
+        if newton.examples._can_capture_gpu(self.model.device) and not wp.config.verify_cuda:
             for _ in range(2 if self.sim_substeps % 2 else 1):
                 with wp.ScopedCapture() as capture:
                     self.simulate()

@@ -25,6 +25,11 @@ _DEPRECATED_WARP_CONFIG_KEYS = {"quiet", "verbose"}
 logger = logging.getLogger(__name__)
 
 
+def _can_capture_gpu(device) -> bool:
+    """Check GPU graph capture while supporting older Warp device descriptions."""
+    return getattr(device, "is_gpu", device.is_cuda) and getattr(device, "is_graph_capture_supported", device.is_cuda)
+
+
 def get_source_directory() -> str:
     return os.path.realpath(os.path.dirname(__file__))
 

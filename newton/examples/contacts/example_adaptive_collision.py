@@ -168,7 +168,7 @@ class Example:
         self._collide(self.state_0, self.frame_dt)
 
         self.graph = None
-        if wp.get_device().is_cuda:
+        if newton.examples._can_capture_gpu(wp.get_device()):
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph

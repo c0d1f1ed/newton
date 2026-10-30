@@ -260,7 +260,7 @@ class Example:
     # ------------------------------------------------------------------
     def capture(self) -> None:
         """Capture the substep loop into a CUDA graph for fast replay."""
-        if self.solver.device.is_cuda:
+        if newton.examples._can_capture_gpu(self.solver.device):
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph

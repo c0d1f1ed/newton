@@ -19,6 +19,7 @@ import numpy as np
 import warp as wp
 
 import newton
+import newton.examples
 
 
 @wp.kernel
@@ -515,7 +516,7 @@ class Example:
     def capture(self):
         """Capture one simulation frame."""
         self.graph = None
-        if self.device.is_cuda:
+        if newton.examples._can_capture_gpu(self.device):
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph

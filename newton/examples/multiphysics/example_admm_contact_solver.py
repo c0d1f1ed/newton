@@ -171,7 +171,7 @@ class Example:
         self.capture()
 
     def capture(self):
-        if not self.model.device.is_cuda:
+        if not newton.examples._can_capture_gpu(self.model.device):
             self.graph = None
             return
 
@@ -180,7 +180,7 @@ class Example:
                 self.simulate()
         self.graph = capture.graph
         if self.graph is None:
-            raise RuntimeError(f"CUDA graph capture failed on device {self.model.device}")
+            raise RuntimeError(f"GPU graph capture failed on device {self.model.device}")
 
     def simulate(self):
         for _ in range(self.sim_substeps):

@@ -172,7 +172,7 @@ class _SolverLayer:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def _capture(self) -> wp.Graph | None:
-        if not wp.get_device().is_cuda:
+        if not newton.examples._can_capture_gpu(wp.get_device()):
             return None
         try:
             with wp.ScopedCapture() as capture:
@@ -180,7 +180,7 @@ class _SolverLayer:
             return capture.graph
         except Exception as exc:
             warnings.warn(
-                f"CUDA graph capture failed for layer '{self.layer_id}': {exc}",
+                f"GPU graph capture failed for layer '{self.layer_id}': {exc}",
                 stacklevel=2,
             )
             return None

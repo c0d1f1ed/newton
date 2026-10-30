@@ -321,7 +321,7 @@ class Example:
         counts run without graph capture.
         """
         self.graph = None
-        if wp.get_device().is_cuda and self.sim_substeps % 2 == 0:
+        if newton.examples._can_capture_gpu(wp.get_device()) and self.sim_substeps % 2 == 0:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph

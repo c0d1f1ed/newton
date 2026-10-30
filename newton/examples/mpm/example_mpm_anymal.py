@@ -206,7 +206,7 @@ class Example:
         self.graph = capture.graph
 
         self.sand_graph = None
-        if wp.get_device().is_cuda and self.mpm_solver.grid_type == "fixed":
+        if newton.examples._can_capture_gpu(wp.get_device()) and self.mpm_solver.grid_type == "fixed":
             with wp.ScopedCapture() as capture:
                 self.simulate_sand()
             self.sand_graph = capture.graph

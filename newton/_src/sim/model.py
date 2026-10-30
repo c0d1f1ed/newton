@@ -1950,7 +1950,7 @@ class Model:
         wp.launch_tiled(
             kernel=compute_shape_local_bounds,
             dim=shape_count,
-            block_dim=SHAPE_BOUNDS_BLOCK_DIM,
+            block_dim=1 if getattr(device, "is_webgpu", False) else SHAPE_BOUNDS_BLOCK_DIM,
             inputs=[
                 self.shape_type,
                 self.shape_source_ptr,

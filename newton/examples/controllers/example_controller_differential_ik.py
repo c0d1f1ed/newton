@@ -370,7 +370,7 @@ class Example:
         # by the dragged gizmos) runs outside the graph, into this same
         # persistent buffer, before every replay -- see step().
         self.graph = None
-        if self.controller.is_graphable() and self.device.is_cuda:
+        if self.controller.is_graphable() and newton.examples._can_capture_gpu(self.device):
             with wp.ScopedCapture() as capture:
                 self._simulate()
             self.graph = capture.graph

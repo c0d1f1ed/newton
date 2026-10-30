@@ -115,7 +115,7 @@ class Example:
         self.surface_z = float(CABLE_CENTER[2]) - self.payload_radius
 
         self._build_scene()
-        self.use_graph = self.use_graph and self.device.is_cuda
+        self.use_graph = self.use_graph and newton.examples._can_capture_gpu(self.device)
         self.control = self.model.control()
         self._build_solvers(args)
         self._build_ik()
