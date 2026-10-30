@@ -1,0 +1,1 @@
+Add ordered UInt32 phases for non-speculative WebGPU contact reduction over completed candidate buffers, preserving packed winner ordering, contact IDs, bounded table capacity, duplicate suppression, and overflow counters. Keep speculative, hydroelastic, and inline mesh-SDF reduction explicitly unsupported.

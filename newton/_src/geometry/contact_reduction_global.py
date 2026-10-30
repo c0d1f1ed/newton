@@ -636,6 +636,14 @@ def unpack_contact_id(packed: wp.uint64, deterministic: int) -> int:
 
 
 @wp.func
+def _unpack_contact_id_portable(packed: wp.uint64, deterministic: int) -> int:
+    """Extract the same contact bits without a native C++ snippet."""
+    if deterministic != 0:
+        return int(wp.uint32(packed) & wp.uint32(0xFFFFF))
+    return int(wp.uint32(packed))
+
+
+@wp.func
 def encode_oct(n: wp.vec3) -> wp.vec2:
     """Encode a unit normal into octahedral 2D representation.
 
@@ -2199,42 +2207,50 @@ def write_contact_to_reducer(
     )
 
 
-@wp.func
-def _roundoff_duplicate_bit_for_slot_pair(
-    pair_idx: int,
-    entry_idx: int,
-    ht_capacity: int,
-    ht_values: wp.array[wp.uint64],
-    position_depth: wp.array[wp.vec4],
-    normal: wp.array[wp.vec2],
-    contact_fingerprints: wp.array[wp.int32],
-    deterministic: int,
-) -> int:
-    """Return the slot bit to suppress for one pair, or zero."""
-    slot_b = int(1)
-    while pair_idx >= slot_b:
-        pair_idx = pair_idx - slot_b
-        slot_b = slot_b + 1
-    slot_a = pair_idx
+def _create_roundoff_duplicate_bit_for_slot_pair(unpack_func):
+    """Specialize duplicate suppression for the selected packed-ID decoder."""
 
-    value_a = ht_values[slot_a * ht_capacity + entry_idx]
-    value_b = ht_values[slot_b * ht_capacity + entry_idx]
-    if value_a == wp.uint64(0) or value_b == wp.uint64(0):
-        return 0
+    @wp.func
+    def duplicate_bit_for_slot_pair(
+        pair_idx: int,
+        entry_idx: int,
+        ht_capacity: int,
+        ht_values: wp.array[wp.uint64],
+        position_depth: wp.array[wp.vec4],
+        normal: wp.array[wp.vec2],
+        contact_fingerprints: wp.array[wp.int32],
+        deterministic: int,
+    ) -> int:
+        """Return the slot bit to suppress for one pair, or zero."""
+        slot_b = int(1)
+        while pair_idx >= slot_b:
+            pair_idx = pair_idx - slot_b
+            slot_b = slot_b + 1
+        slot_a = pair_idx
 
-    contact_a = unpack_contact_id(value_a, deterministic)
-    contact_b = unpack_contact_id(value_b, deterministic)
-    if contact_a == contact_b:
-        return 0
-    if not _contacts_are_numerically_equivalent(contact_a, contact_b, position_depth, normal):
-        return 0
+        value_a = ht_values[slot_a * ht_capacity + entry_idx]
+        value_b = ht_values[slot_b * ht_capacity + entry_idx]
+        if value_a == wp.uint64(0) or value_b == wp.uint64(0):
+            return 0
 
-    if contact_fingerprints[contact_b] < contact_fingerprints[contact_a]:
-        return 1 << slot_a
-    return 1 << slot_b
+        contact_a = unpack_func(value_a, deterministic)
+        contact_b = unpack_func(value_b, deterministic)
+        if contact_a == contact_b:
+            return 0
+        if not _contacts_are_numerically_equivalent(contact_a, contact_b, position_depth, normal):
+            return 0
+
+        if contact_fingerprints[contact_b] < contact_fingerprints[contact_a]:
+            return 1 << slot_a
+        return 1 << slot_b
+
+    return duplicate_bit_for_slot_pair
 
 
-def create_export_reduced_contacts_kernel(writer_func: Any):
+_roundoff_duplicate_bit_for_slot_pair = _create_roundoff_duplicate_bit_for_slot_pair(unpack_contact_id)
+
+
+def create_export_reduced_contacts_kernel(writer_func: Any, *, portable: bool = False):
     """Create a tiled kernel that exports globally reduced contacts.
 
     One thread block processes each active hashtable entry. Its first 21 lanes
@@ -2242,9 +2258,16 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
     lower-fingerprint representative for roundoff-equivalent geometry. CUDA
     lanes export the seven surviving slots concurrently in fast mode; CPU and
     deterministic paths stream them serially from lane zero.
+
+    ``portable=True`` selects a snippet-free ID decoder and serial duplicate
+    comparisons. Launch that specialization with one logical lane per block.
     """
     exported_ids_vec = wp.types.vector(length=VALUES_PER_KEY, dtype=wp.int32)
-    _module = f"export_reduced_contacts_{writer_func.__name__}"
+    _module = f"export_reduced_contacts_{writer_func.__name__}" + ("_portable" if portable else "")
+    unpack_func = _unpack_contact_id_portable if portable else unpack_contact_id
+    duplicate_bit_for_slot_pair = (
+        _create_roundoff_duplicate_bit_for_slot_pair(unpack_func) if portable else _roundoff_duplicate_bit_for_slot_pair
+    )
 
     @wp.func
     def export_contact_id(
@@ -2309,14 +2332,17 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
         ht_capacity = ht_keys.shape[0]
         num_active = ht_active_slots[ht_capacity]
         duplicate_bits = wp.tile_zeros(shape=wp.static(EXPORT_REDUCED_CONTACTS_BLOCK_DIM), dtype=int, storage="shared")
+        use_parallel = parallel_pairs != 0
+        if wp.static(portable):
+            use_parallel = False
 
         for active_idx in range(block_id, num_active, total_num_blocks):
             entry_idx = ht_active_slots[active_idx]
             duplicate_bit = int(0)
 
-            if parallel_pairs != 0:
+            if use_parallel:
                 if lane < wp.static(PAIRS_PER_KEY):
-                    duplicate_bit = _roundoff_duplicate_bit_for_slot_pair(
+                    duplicate_bit = duplicate_bit_for_slot_pair(
                         lane,
                         entry_idx,
                         ht_capacity,
@@ -2328,7 +2354,7 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
                     )
             elif lane == 0:
                 for pair_idx in range(wp.static(PAIRS_PER_KEY)):
-                    duplicate_bit = duplicate_bit | _roundoff_duplicate_bit_for_slot_pair(
+                    duplicate_bit = duplicate_bit | duplicate_bit_for_slot_pair(
                         pair_idx,
                         entry_idx,
                         ht_capacity,
@@ -2339,14 +2365,16 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
                         deterministic,
                     )
 
-            wp.tile_scatter_masked(duplicate_bits, lane, duplicate_bit, True)
-            duplicate_mask = wp.tile_reduce(wp.bit_or, duplicate_bits)[0]
+            duplicate_mask = duplicate_bit
+            if wp.static(not portable):
+                wp.tile_scatter_masked(duplicate_bits, lane, duplicate_bit, True)
+                duplicate_mask = wp.tile_reduce(wp.bit_or, duplicate_bits)[0]
 
-            if parallel_pairs != 0 and deterministic == 0:
+            if use_parallel and deterministic == 0:
                 if lane < wp.static(VALUES_PER_KEY) and duplicate_mask & (1 << lane) == 0:
                     value = ht_values[lane * ht_capacity + entry_idx]
                     if value != wp.uint64(0):
-                        contact_id = unpack_contact_id(value, deterministic)
+                        contact_id = unpack_func(value, deterministic)
                         if contact_id != 0:
                             export_contact_id(
                                 contact_id,
@@ -2371,7 +2399,7 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
                     if value == wp.uint64(0):
                         continue
 
-                    contact_id = unpack_contact_id(value, deterministic)
+                    contact_id = unpack_func(value, deterministic)
                     if contact_id == 0:
                         continue
                     if is_contact_already_exported(contact_id, exported_ids, num_exported):
@@ -2394,7 +2422,8 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
 
             # Clear cooperatively so lane 0 finishes exporting before any warp
             # can reuse the shared tile for the next active entry.
-            wp.tile_scatter_masked(duplicate_bits, lane, int(0), True)
+            if wp.static(not portable):
+                wp.tile_scatter_masked(duplicate_bits, lane, int(0), True)
 
     return export_reduced_contacts_kernel
 

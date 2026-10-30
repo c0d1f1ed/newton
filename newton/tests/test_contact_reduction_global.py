@@ -3,6 +3,8 @@
 
 """Tests for the global contact reduction module."""
 
+import gc
+import tempfile
 import unittest
 
 import numpy as np
@@ -15,6 +17,11 @@ from newton._src.geometry.contact_data import (
     make_contact_sort_key_with_bits,
 )
 from newton._src.geometry.contact_reduction import float_flip
+from newton._src.geometry.contact_reduction_buffered import (
+    BufferedContactReducer,
+    _find_or_insert_key_row,
+    _reduce_packed_word,
+)
 from newton._src.geometry.contact_reduction_global import (
     CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD,
     EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
@@ -34,6 +41,7 @@ from newton._src.geometry.contact_reduction_global import (
     export_and_reduce_contact_centered_two_spatial_depths,
     export_contact_to_buffer,
     make_contact_key,
+    reduce_buffered_contacts_kernel,
 )
 from newton._src.geometry.hashtable import hashtable_find_or_insert
 from newton._src.geometry.narrow_phase import ContactWriterData
@@ -87,7 +95,16 @@ def get_winning_contacts(reducer: GlobalContactReducer) -> list[int]:
 class TestGlobalContactReducer(unittest.TestCase):
     """Test cases for GlobalContactReducer."""
 
-    pass
+    def test_buffered_unsupported_modes(self):
+        """Reject reducer modes that need provisional or hydroelastic updates."""
+        for options in ({"store_hydroelastic_data": True}, {"enable_contact_reclamation": True}):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(NotImplementedError, "hydroelastic or provisional"),
+            ):
+                BufferedContactReducer(GlobalContactReducer(4, device="cpu", **options))
+        with self.assertRaisesRegex(ValueError, "enabled reduction table"):
+            BufferedContactReducer(GlobalContactReducer(4, device="cpu", enable_reduction=False))
 
 
 class TestKeyConstruction(unittest.TestCase):
@@ -749,7 +766,7 @@ def test_export_reduced_contacts_kernel(test, device):
     # One block must reuse its shared duplicate-bit tile for every active entry.
     total_blocks = 1
 
-    def launch_and_verify():
+    def launch_and_verify(export_kernel, block_dim, parallel_pairs):
         wp.launch_tiled(
             export_kernel,
             dim=total_blocks,
@@ -767,11 +784,11 @@ def test_export_reduced_contacts_kernel(test, device):
                 shape_gap,
                 writer_data,
                 total_blocks,
-                int(not device.is_cpu),
+                parallel_pairs,
                 0,  # deterministic=0 (fast packing)
             ],
             device=device,
-            block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
+            block_dim=block_dim,
         )
 
         # ID zero is skipped, leaving five distinct pairs plus one representative
@@ -789,11 +806,18 @@ def test_export_reduced_contacts_kernel(test, device):
         test.assertEqual(len(distinct_pair), VALUES_PER_KEY)
         np.testing.assert_array_equal(np.sort(positions[distinct_pair, 0]), np.arange(20.0, 27.0, dtype=np.float32))
 
-    launch_and_verify()
+    launch_and_verify(export_kernel, EXPORT_REDUCED_CONTACTS_BLOCK_DIM, int(not device.is_cpu))
     for _ in range(10):
         reducer.exported_flags.zero_()
         contact_count_out.zero_()
-        launch_and_verify()
+        launch_and_verify(export_kernel, EXPORT_REDUCED_CONTACTS_BLOCK_DIM, int(not device.is_cpu))
+
+    # The portable factory retains all 21 comparisons and exports all seven
+    # slots when one invocation owns the entire entry.
+    portable_export_kernel = create_export_reduced_contacts_kernel(test_writer, portable=True)
+    reducer.exported_flags.zero_()
+    contact_count_out.zero_()
+    launch_and_verify(portable_export_kernel, 1, 0)
 
 
 def test_key_uniqueness(test, device):
@@ -1845,6 +1869,328 @@ add_function_test(
     "test_deterministic_identical_across_runs",
     test_deterministic_identical_across_runs,
     devices=devices,
+)
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _reduce_test_words(
+    values: wp.array[wp.uint64], high: wp.array[wp.uint32], low: wp.array[wp.uint32], high_pass: bool
+):
+    index = wp.tid()
+    _reduce_packed_word(index % high.shape[0], values[index], high, low, high_pass)
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _insert_test_key_rows(
+    candidates: wp.array[wp.uint64],
+    rows: wp.array[int],
+    keys: wp.array[wp.uint64],
+    active: wp.array[int],
+    entries: wp.array[int],
+):
+    row = wp.tid()
+    entries[row] = _find_or_insert_key_row(row, candidates, rows, keys, active)
+
+
+def test_buffered_packed_words_and_full_table(test, device):
+    """Preserve UInt64 ties and bound probing after immutable-key publication."""
+    # Each column has a distinct limb corner case: a zero high limb, a zero low
+    # limb, negative infinity's flipped bits, and unsigned high-bit ordering.
+    words = np.array(
+        [
+            0,
+            0x100000000,
+            0x007FFFFF00000001,
+            0xFFFFFFFF00000000,
+            0xFFFFFFFF,
+            0x100000001,
+            0x007FFFFF000FFFFF,
+            0xFFFFFFFEFFFFFFFF,
+            1,
+            0xFFFFFFFF,
+            0x007FFFFEFFFFFFFF,
+            0xFFFFFFFF00000001,
+            0x8000000000000001,
+            0x7FFFFFFFFFFFFFFF,
+            0x8000000000000000,
+            0x7FFFFFFF00000001,
+            0x7FFFFFFFFFFFFFFF,
+            0x8000000000000000,
+            0x7FFFFFFF00000003,
+            0x8000000000000000,
+        ],
+        dtype=np.uint64,
+    )
+    packed = wp.zeros(4, dtype=wp.uint64, device=device)
+    limbs = packed.view(wp.vec2ui).view(wp.uint32)
+    values = wp.array(words, dtype=wp.uint64, device=device)
+    for high_pass in (True, False):
+        wp.launch(
+            _reduce_test_words, dim=len(words), inputs=[values, limbs[:, 1], limbs[:, 0], high_pass], device=device
+        )
+    np.testing.assert_array_equal(packed.numpy(), words.reshape(-1, 4).max(axis=0))
+
+    # A deliberately tiny table forces collisions and complete-table probes.
+    # Every key is immutable before any row index can become visible.
+    candidate_values = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1], dtype=np.uint64)
+    candidates = wp.array(candidate_values, dtype=wp.uint64, device=device)
+    rows = wp.full(8, -1, dtype=int, device=device)
+    keys = wp.full(8, wp.uint64(0xFFFFFFFFFFFFFFFF), dtype=wp.uint64, device=device)
+    active = wp.zeros(9, dtype=int, device=device)
+    entries = wp.empty(len(candidate_values), dtype=int, device=device)
+    wp.launch(
+        _insert_test_key_rows,
+        dim=len(candidate_values),
+        inputs=[candidates, rows, keys, active, entries],
+        device=device,
+    )
+    key_np, row_np, entry_np = keys.numpy(), rows.numpy(), entries.numpy()
+    test.assertEqual(int(active.numpy()[8]), 8)
+    test.assertEqual(len(set(key_np.tolist())), 8)
+    np.testing.assert_array_equal(key_np, candidate_values[row_np])
+    for key, entry in zip(candidate_values, entry_np, strict=True):
+        if int(key) in key_np:
+            test.assertGreaterEqual(entry, 0)
+            test.assertEqual(key_np[entry], key)
+        else:
+            test.assertEqual(entry, -1)
+
+
+def _buffered_fixture(device, deterministic):
+    """Build completed contacts with fixed IDs and score/fingerprint ties."""
+    count = 24
+    reducer = GlobalContactReducer(count, device=device, deterministic=deterministic)
+    positions = np.zeros((count + 1, 4), dtype=np.float32)
+    indices = np.arange(count)
+    positions[1:, 0] = (indices % 4 - 1.5) * 0.1
+    positions[1:, 1] = (indices // 4 % 3 - 1) * 0.1
+    positions[1:, 2] = (indices % 3 - 1) * 0.1
+    positions[1:, 3] = np.where(indices % 3 == 0, -0.03, 0.0)
+    positions[2] = positions[1]  # Equal score with a different fingerprint/ID.
+    pairs = np.zeros((count + 1, 2), dtype=np.int32)
+    pairs[1:, 0] = indices % 2
+    pairs[1:, 1] = 2 + indices % 3
+    pairs[2] = pairs[1]
+    reducer.position_depth.assign(positions)
+    reducer.normal.fill_(wp.vec2(0.0))
+    reducer.shape_pairs.assign(pairs)
+    reducer.contact_fingerprints.assign(np.arange(count + 1, dtype=np.int32)[::-1].copy())
+    reducer.contact_count.fill_(count + 3)
+    reducer.buffer_overflows.fill_(3)
+    reducer.ht_insert_failures.fill_(2)
+    geometry = (
+        wp.full(5, wp.transform_identity(), dtype=wp.transform, device=device),
+        wp.full(5, wp.vec3(-1.0), dtype=wp.vec3, device=device),
+        wp.full(5, wp.vec3(1.0), dtype=wp.vec3, device=device),
+        wp.full(5, wp.vec3i(4), dtype=wp.vec3i, device=device),
+    )
+    return reducer, geometry
+
+
+def _packed_table(reducer):
+    """Read semantic table contents independently of insertion order."""
+    return _packed_table_arrays(reducer.hashtable.keys, reducer.ht_values, reducer.hashtable.active_slots)
+
+
+def _packed_table_arrays(keys, values, active):
+    """Read a key-to-packed-values mapping from independent graph outputs."""
+    capacity = keys.shape[0]
+    keys = keys.numpy()
+    values = values.numpy().reshape(VALUES_PER_KEY, capacity)
+    active = active.numpy()
+    return {int(keys[entry]): tuple(int(word) for word in values[:, entry]) for entry in active[: active[capacity]]}
+
+
+def test_buffered_reduction_matches_native(test, device):
+    """Match native packed winners while preserving IDs and overflow counters."""
+    for deterministic in (False, True):
+        reference, reference_geometry = _buffered_fixture("cpu", deterministic)
+        wp.launch(
+            reduce_buffered_contacts_kernel,
+            dim=reference.capacity,
+            inputs=[reference.get_data_struct(), *reference_geometry, reference.capacity],
+            device="cpu",
+        )
+        expected = _packed_table(reference)
+        reducer, geometry = _buffered_fixture(device, deterministic)
+        companion = BufferedContactReducer(reducer)
+        companion.clear()
+        companion.reduce(*geometry)
+        observed = _packed_table(reducer)
+        if wp.get_device(device).is_cpu:
+            test.assertEqual(observed, expected)
+        else:
+            # Projection arithmetic and signed-zero results can differ across
+            # native CPU/CUDA/Metal. Check keys and complete winner bits here;
+            # precomputed-word tests independently check exact UInt64 maxima.
+            winner_mask = (1 << 42) - 1 if deterministic else (1 << 32) - 1
+            test.assertEqual(
+                {key: tuple(word & winner_mask for word in values) for key, values in observed.items()},
+                {key: tuple(word & winner_mask for word in values) for key, values in expected.items()},
+            )
+        test.assertEqual(get_contact_count(reducer), reducer.capacity + 3)
+        test.assertEqual(int(reducer.buffer_overflows.numpy()[0]), 3)
+        test.assertEqual(int(reducer.ht_insert_failures.numpy()[0]), 2)
+        test.assertEqual(companion.low.ptr, reducer.ht_values.ptr)
+        test.assertEqual(companion.high.ptr, reducer.ht_values.ptr + 4)
+        test.assertEqual(companion.low.strides, (8,))
+        # Ordinary clear plus companion clear removes every published row and
+        # both value limbs; the next completed buffer must not inherit winners.
+        reducer.clear_active()
+        companion.clear()
+        reducer.contact_count.fill_(1)
+        companion.reduce(*geometry)
+        test.assertEqual(len(_packed_table(reducer)), 2)
+        test.assertEqual(get_winning_contacts(reducer), [1])
+        test.assertEqual(int(reducer.buffer_overflows.numpy()[0]), 0)
+
+    # Two unique keys per candidate exhaust the real reducer's minimum table.
+    # Saturation may select different admitted keys across concurrent schedules;
+    # its bounded active count and one failure per rejected key remain exact.
+    count = 520
+    reducer = GlobalContactReducer(count, device=device, hashtable_size_factor=0.01)
+    companion = BufferedContactReducer(reducer)
+    reducer.position_depth.fill_(wp.vec4(0.0, 0.0, 0.0, -0.1))
+    reducer.normal.fill_(wp.vec2(0.0))
+    pairs = np.zeros((count + 1, 2), dtype=np.int32)
+    pairs[1:, 1] = np.arange(1, count + 1)
+    reducer.shape_pairs.assign(pairs)
+    reducer.contact_count.fill_(count + 4)
+    reducer.buffer_overflows.fill_(4)
+    companion.reduce(*geometry)
+    test.assertEqual(get_active_slot_count(reducer), reducer.hashtable.capacity)
+    test.assertEqual(int(reducer.ht_insert_failures.numpy()[0]), 2 * count - reducer.hashtable.capacity)
+    test.assertEqual(get_contact_count(reducer), count + 4)
+    test.assertEqual(int(reducer.buffer_overflows.numpy()[0]), 4)
+
+
+def test_buffered_reduction_capture_ownership(test, device):
+    """Retain strided limb owners through captured and serialized phase replay."""
+    reducer, geometry = _buffered_fixture(device, True)
+    companion = BufferedContactReducer(reducer)
+    companion.reduce(*geometry)
+    expected = _packed_table(reducer)
+    with wp.ScopedCapture(device=device, apic=True) as capture:
+        reducer.clear_active()
+        companion.clear()
+        reducer.contact_count.fill_(reducer.capacity + 3)
+        reducer.buffer_overflows.fill_(3)
+        reducer.ht_insert_failures.fill_(2)
+        companion.reduce(*geometry)
+    outputs = {
+        "keys": reducer.hashtable.keys,
+        "values": reducer.ht_values,
+        "active": reducer.hashtable.active_slots,
+    }
+    del companion, reducer, geometry
+    gc.collect()
+    pressure = wp.full(outputs["values"].shape[0], wp.uint64(17), dtype=wp.uint64, device=device)
+    wp.capture_launch(capture.graph)
+    test.assertEqual(_packed_table_arrays(outputs["keys"], outputs["values"], outputs["active"]), expected)
+    with tempfile.TemporaryDirectory() as directory:
+        path = f"{directory}/buffered_reduction"
+        wp.capture_save(capture.graph, path, outputs=outputs)
+        loaded = wp.capture_load(path, device=device)
+    wp.capture_launch(loaded)
+    restored = {name: wp.empty_like(value) for name, value in outputs.items()}
+    for name, value in restored.items():
+        loaded.get_param(name, value)
+    test.assertEqual(_packed_table_arrays(restored["keys"], restored["values"], restored["active"]), expected)
+    np.testing.assert_array_equal(pressure.numpy(), np.full(pressure.shape[0], 17, dtype=np.uint64))
+
+
+def test_buffered_reduction_export(test, device):
+    """Match native export and deduplication for fast and deterministic winners."""
+
+    @wp.func
+    def buffered_test_writer(contact_data: ContactData, writer_data: ContactWriterData, output_index: int):
+        index = wp.atomic_add(writer_data.contact_count, 0, 1)
+        if index < writer_data.contact_max:
+            writer_data.contact_pair[index] = wp.vec2i(contact_data.shape_a, contact_data.shape_b)
+            writer_data.contact_position[index] = contact_data.contact_point_center
+            writer_data.contact_normal[index] = contact_data.contact_normal_a_to_b
+            writer_data.contact_penetration[index] = contact_data.contact_distance
+
+    def export(reducer, *, portable):
+        output_device = reducer.position_depth.device
+        writer_data = ContactWriterData()
+        writer_data.contact_max = reducer.capacity
+        writer_data.contact_count = wp.zeros(1, dtype=int, device=output_device)
+        writer_data.contact_pair = wp.zeros(reducer.capacity, dtype=wp.vec2i, device=output_device)
+        writer_data.contact_position = wp.zeros(reducer.capacity, dtype=wp.vec3, device=output_device)
+        writer_data.contact_normal = wp.zeros(reducer.capacity, dtype=wp.vec3, device=output_device)
+        writer_data.contact_penetration = wp.zeros(reducer.capacity, dtype=float, device=output_device)
+        writer_data.contact_tangent = wp.zeros(0, dtype=wp.vec3, device=output_device)
+        wp.launch_tiled(
+            create_export_reduced_contacts_kernel(buffered_test_writer, portable=portable),
+            dim=1,
+            inputs=[
+                reducer.hashtable.keys,
+                reducer.ht_values,
+                reducer.hashtable.active_slots,
+                reducer.position_depth,
+                reducer.normal,
+                reducer.shape_pairs,
+                reducer.contact_fingerprints,
+                reducer.exported_flags,
+                wp.zeros(5, dtype=int, device=output_device),
+                wp.full(5, wp.vec4(1.0), dtype=wp.vec4, device=output_device),
+                wp.zeros(5, dtype=float, device=output_device),
+                writer_data,
+                1,
+                0,
+                int(reducer.deterministic),
+            ],
+            device=output_device,
+            block_dim=1 if portable else EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
+        )
+        count = int(writer_data.contact_count.numpy()[0])
+        records = np.column_stack(
+            (
+                writer_data.contact_pair.numpy()[:count],
+                writer_data.contact_position.numpy()[:count],
+                writer_data.contact_normal.numpy()[:count],
+                writer_data.contact_penetration.numpy()[:count],
+            )
+        )
+        return sorted(tuple(record) for record in records)
+
+    for deterministic in (False, True):
+        reference, geometry = _buffered_fixture("cpu", deterministic)
+        wp.launch(
+            reduce_buffered_contacts_kernel,
+            dim=reference.capacity,
+            inputs=[reference.get_data_struct(), *geometry, reference.capacity],
+            device="cpu",
+        )
+        expected = export(reference, portable=False)
+        test.assertGreater(len(expected), VALUES_PER_KEY)
+        reducer, geometry = _buffered_fixture(device, deterministic)
+        companion = BufferedContactReducer(reducer)
+        companion.reduce(*geometry)
+        test.assertEqual(export(reducer, portable=True), expected)
+
+
+add_function_test(
+    TestGlobalContactReducer,
+    "test_buffered_packed_words_and_full_table",
+    test_buffered_packed_words_and_full_table,
+    devices=devices,
+)
+add_function_test(
+    TestGlobalContactReducer,
+    "test_buffered_reduction_matches_native",
+    test_buffered_reduction_matches_native,
+    devices=devices,
+)
+add_function_test(
+    TestGlobalContactReducer,
+    "test_buffered_reduction_capture_ownership",
+    test_buffered_reduction_capture_ownership,
+    devices=devices,
+)
+add_function_test(
+    TestGlobalContactReducer, "test_buffered_reduction_export", test_buffered_reduction_export, devices=devices
 )
 
 

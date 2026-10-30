@@ -51,6 +51,7 @@ from ..geometry.contact_data import (
     make_contact_sort_key_with_bits,
     prepare_speculative_contact,
 )
+from ..geometry.contact_reduction_buffered import BufferedContactReducer, reject_inline_reduction_routes
 from ..geometry.contact_reduction_global import (
     EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
     EXPORT_REDUCED_CONTACTS_THREAD_BUDGET_MULTIPLIER,
@@ -2922,10 +2923,18 @@ class NarrowPhase:
         # Create global contact reduction kernels for mesh/heightfield-triangle
         # contacts (mirror the predicate used to gate ``self.reduce_contacts``
         # above so heightfield-only scenes also get the reducer allocated).
+        self._buffered_contact_reducer = None
         if self.reduce_contacts and (has_meshes or has_heightfields):
+            portable_reduction = getattr(device_obj, "is_webgpu", False)
+            if portable_reduction and (speculative or hydroelastic_sdf is not None):
+                raise NotImplementedError(
+                    "WebGPU buffered contact reduction does not support speculative or hydroelastic contacts"
+                )
             # Global contact reducer uses hardcoded BETA_THRESHOLD (0.1mm) same as shared-memory reduction
             # Slot layout: NUM_SPATIAL_DIRECTIONS spatial + 1 max-depth = VALUES_PER_KEY slots per key
-            self.export_reduced_contacts_kernel = create_export_reduced_contacts_kernel(writer_func)
+            self.export_reduced_contacts_kernel = create_export_reduced_contacts_kernel(
+                writer_func, portable=portable_reduction
+            )
             # Global contact reducer for all mesh contact types
             self.global_contact_reducer = GlobalContactReducer(
                 max_triangle_pairs,
@@ -2934,6 +2943,8 @@ class NarrowPhase:
                 hashtable_size_factor=contact_reduction_hashtable_size_factor,
                 enable_contact_reclamation=speculative,
             )
+            if portable_reduction:
+                self._buffered_contact_reducer = BufferedContactReducer(self.global_contact_reducer)
         else:
             self.export_reduced_contacts_kernel = None
             self.global_contact_reducer = None
@@ -3622,6 +3633,8 @@ class NarrowPhase:
                 # Unified global reduction for all mesh contact types.
                 assert self.global_contact_reducer is not None
                 self.global_contact_reducer.clear_active()
+                if self._buffered_contact_reducer is not None:
+                    self._buffered_contact_reducer.clear()
                 reducer_data = self.global_contact_reducer.get_data_struct()
 
                 # Mesh-plane contacts → global reducer (meshes only)
@@ -3719,7 +3732,14 @@ class NarrowPhase:
             # Register mesh-plane/mesh-triangle contacts in hashtable BEFORE mesh-mesh.
             # Mesh-mesh does inline hashtable registration in its kernel.
             if self.reduce_contacts:
-                if self.speculative:
+                if self._buffered_contact_reducer is not None:
+                    self._buffered_contact_reducer.reduce(
+                        shape_transform,
+                        shape_collision_aabb_lower,
+                        shape_collision_aabb_upper,
+                        shape_voxel_resolution,
+                    )
+                elif self.speculative:
                     wp.launch(
                         kernel=reduce_buffered_contacts_speculative_kernel,
                         dim=self.total_num_threads,
@@ -3774,7 +3794,19 @@ class NarrowPhase:
             if shape_edge_range is None:
                 shape_edge_range = self._empty_edge_range
 
-            if self.mesh_mesh_contacts_kernel is not None and self.max_mesh_mesh_pairs > 0:
+            if (
+                self._buffered_contact_reducer is not None
+                and self.max_mesh_mesh_pairs > 0
+                and self.shape_pairs_mesh_mesh_count is not None
+            ):
+                wp.launch(
+                    reject_inline_reduction_routes,
+                    dim=1,
+                    inputs=[self.shape_pairs_mesh_mesh_count],
+                    device=device,
+                    record_tape=False,
+                )
+            elif self.mesh_mesh_contacts_kernel is not None and self.max_mesh_mesh_pairs > 0:
                 mesh_mesh_contacts_kernel = (
                     self.mesh_mesh_contacts_kernel_precomputed
                     if has_precomputed_edge_data
@@ -3879,7 +3911,10 @@ class NarrowPhase:
             if self.reduce_contacts:
                 # Export has only one writer lane per block, so use a wider grid than
                 # the contact-generation kernels. On CPU, tiled kernels expose one lane.
-                effective_block_dim = min(self.block_dim, EXPORT_REDUCED_CONTACTS_BLOCK_DIM)
+                export_block_dim = (
+                    1 if self._buffered_contact_reducer is not None else EXPORT_REDUCED_CONTACTS_BLOCK_DIM
+                )
+                effective_block_dim = min(self.block_dim, export_block_dim)
                 export_num_blocks = max(
                     1,
                     EXPORT_REDUCED_CONTACTS_THREAD_BUDGET_MULTIPLIER * self.total_num_threads // effective_block_dim,
@@ -3901,11 +3936,11 @@ class NarrowPhase:
                         shape_gap,
                         writer_data,
                         export_num_blocks,
-                        int(self.block_dim > 1),
+                        int(effective_block_dim > 1),
                         int(self.global_contact_reducer.deterministic),
                     ],
                     device=device,
-                    block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
+                    block_dim=export_block_dim,
                     record_tape=False,
                 )
         if self.hydroelastic_sdf is not None:
