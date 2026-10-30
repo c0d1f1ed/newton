@@ -19,11 +19,20 @@ from newton._src.sim.shape_contact_pairs import (
     _ShapeContactPairs,
 )
 from newton._src.solvers.coupled.model_view import ModelView
-from newton._src.solvers.kamino._src.core.conversions import compute_required_contact_capacity
+from newton._src.solvers.kamino._src.core.conversions import (
+    _accumulate_contact_capacity,
+    compute_required_contact_capacity,
+)
 from newton._src.solvers.kamino._src.core.model import ModelKamino
 from newton._src.solvers.kamino._src.core.shapes import max_contacts_for_shape_pair
 from newton._src.viewer.viewer_file import depointer_as_key, pointer_as_key, transfer_to_model
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
+
+
+@wp.kernel
+def _contact_capacity_counter_kernel(values: wp.array[wp.uint32], counts: wp.array2d[wp.uint32]):
+    tid = wp.tid()
+    _accumulate_contact_capacity(tid % 2, values[tid], counts)
 
 
 def _make_builder():
@@ -521,6 +530,22 @@ class TestShapeContactPairs(unittest.TestCase):
                 ):
                     candidate.shape_contact_pairs = pairs[:pair_count]
                     self.assertEqual(compute_required_contact_capacity(candidate, pair_cap, world_cap), capacity)
+
+    def test_kamino_capacity_counter_carry(self):
+        """Accumulate exact capacity words across wraps before host inspection."""
+        values = np.resize(np.array([0xFFFFFFFF, 3, 0x80000000, 0], dtype=np.uint32), 4096)
+        initial = np.array([[0xFFFFFFFD, 7], [0x12345678, 5]], dtype=np.uint32)
+        for device in get_test_devices():
+            with self.subTest(device=device):
+                increments = wp.array(values, dtype=wp.uint32, device=device)
+                counts = wp.array(initial, dtype=wp.uint32, device=device)
+                wp.launch(_contact_capacity_counter_kernel, dim=len(values), inputs=[increments, counts], device=device)
+                result = counts.numpy().astype(np.uint64)
+                actual = result[:, 0] | (result[:, 1] << np.uint64(32))
+                expected = [
+                    int(initial[w, 0]) + (int(initial[w, 1]) << 32) + sum(map(int, values[w::2])) for w in range(2)
+                ]
+                np.testing.assert_array_equal(actual, expected)
 
     def test_kamino_weighted_pair_counts(self):
         """Size contacts from pair weights, preserving caps, globals and replacement arrays."""

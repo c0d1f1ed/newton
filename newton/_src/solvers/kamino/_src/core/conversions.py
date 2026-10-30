@@ -168,19 +168,14 @@ def refresh_masked_body_inertia(
     )
 
 
-@wp.kernel
-def world_max_contacts_kernel(
-    # Inputs:
+@wp.func
+def _contact_capacity_for_pair(
+    shape_pair_id: int,
     max_contacts_per_pair: int,
     model_shape_type: wp.array[wp.int32],
     model_shape_world: wp.array[wp.int32],
     model_shape_contact_pair: wp.array[wp.vec2i],
-    # Outputs:
-    world_max_contacts: wp.array[wp.int64],
 ):
-    # Retrieve the shape pair index from the thread grid
-    shape_pair_id = wp.tid()
-
     # Extract the shape types for this pair.
     shape_pair = model_shape_contact_pair[shape_pair_id]
     shape_type_a = model_shape_type[shape_pair[0]]
@@ -189,7 +184,7 @@ def world_max_contacts_kernel(
     # Assign global-local pairs to the local world and skip global-global pairs.
     world_id = max(model_shape_world[shape_pair[0]], model_shape_world[shape_pair[1]])
     if world_id < 0:
-        return
+        return world_id, 0
 
     # Order types for consistent contact counts.
     if shape_type_a > shape_type_b:
@@ -198,7 +193,46 @@ def world_max_contacts_kernel(
     num_contacts = num_contacts_a + num_contacts_b
     if max_contacts_per_pair >= 0:
         num_contacts = min(num_contacts, max_contacts_per_pair)
-    wp.atomic_add(world_max_contacts, world_id, wp.int64(num_contacts))
+    return world_id, num_contacts
+
+
+@wp.kernel
+def world_max_contacts_kernel(
+    max_contacts_per_pair: int,
+    model_shape_type: wp.array[wp.int32],
+    model_shape_world: wp.array[wp.int32],
+    model_shape_contact_pair: wp.array[wp.vec2i],
+    world_max_contacts: wp.array[wp.int64],
+):
+    world, count = _contact_capacity_for_pair(
+        wp.tid(), max_contacts_per_pair, model_shape_type, model_shape_world, model_shape_contact_pair
+    )
+    if world >= 0:
+        wp.atomic_add(world_max_contacts, world, wp.int64(count))
+
+
+@wp.func
+def _accumulate_contact_capacity(world: int, value: wp.uint32, words: wp.array2d[wp.uint32]):
+    # This is an accumulation-only counter, inspected after the dispatch.
+    # It does not provide a linearizable 64-bit atomic value or old result.
+    previous = wp.atomic_add(words, world, 0, value)
+    if previous + value < previous:
+        wp.atomic_add(words, world, 1, wp.uint32(1))
+
+
+@wp.kernel
+def _world_max_contacts_words_kernel(
+    max_contacts_per_pair: int,
+    model_shape_type: wp.array[wp.int32],
+    model_shape_world: wp.array[wp.int32],
+    model_shape_contact_pair: wp.array[wp.vec2i],
+    words: wp.array2d[wp.uint32],
+):
+    world, count = _contact_capacity_for_pair(
+        wp.tid(), max_contacts_per_pair, model_shape_type, model_shape_world, model_shape_contact_pair
+    )
+    if world >= 0:
+        _accumulate_contact_capacity(world, wp.uint32(count), words)
 
 
 @wp.kernel
@@ -1057,9 +1091,14 @@ def compute_required_contact_capacity(
     ):
         if topology is not None and not normalized_worlds:
             shape_world = wp.array(topology.shape_world, dtype=wp.int32, device=model.device)
-        world_max_contacts_wp = wp.zeros(model.world_count, dtype=wp.int64, device=model.device)
+        portable_counter = getattr(model.device, "is_webgpu", False)
+        world_max_contacts_wp = wp.zeros(
+            (model.world_count, 2) if portable_counter else model.world_count,
+            dtype=wp.uint32 if portable_counter else wp.int64,
+            device=model.device,
+        )
         wp.launch(
-            kernel=world_max_contacts_kernel,
+            kernel=_world_max_contacts_words_kernel if portable_counter else world_max_contacts_kernel,
             dim=model.shape_contact_pair_count,
             inputs=[
                 max_contacts_per_pair if max_contacts_per_pair is not None else -1,
@@ -1071,6 +1110,11 @@ def compute_required_contact_capacity(
             device=model.device,
         )
         world_max_contacts = world_max_contacts_wp.numpy()
+        if portable_counter:
+            words = world_max_contacts.astype(np.uint64)
+            # Pair counts and weights are Int32-bounded, so their sum fits
+            # Int64. Read both words only after all GPU updates complete.
+            world_max_contacts = (words[:, 0] | (words[:, 1] << np.uint64(32))).astype(np.int64)
     else:
         shape_types = model.shape_type.numpy()[: model.shape_count]
         key = (shape_types.tobytes(), max_contacts_per_pair)
