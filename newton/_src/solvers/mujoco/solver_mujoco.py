@@ -9023,6 +9023,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mjw_model.block_dim.solve_init_search_cg = 1
                 self.mjw_model.block_dim.solve_beta_accumulate = 1
                 self.mjw_model.block_dim.solve_search_update_cg = 1
+                # CSR inertia entries are scattered with runtime lane strides
+                # before the complete dense Hessian tile is accumulated.
+                self.mjw_model.block_dim.update_gradient_JTDAJ_dense = 1
                 # This field also partitions Jacobian columns. The provider
                 # recomputes the block count, retaining every DOF/contact row.
                 self.mjw_model.block_dim.contact_jac_tiled = 1

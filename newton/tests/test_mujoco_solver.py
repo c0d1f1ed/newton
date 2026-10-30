@@ -13874,6 +13874,7 @@ class TestMuJoCoLinesearchBlockDim(unittest.TestCase):
             "solve_init_search_cg",
             "solve_beta_accumulate",
             "solve_search_update_cg",
+            "update_gradient_JTDAJ_dense",
             "contact_jac_tiled",
         )
         is_webgpu = getattr(solver.model.device, "is_webgpu", False)
