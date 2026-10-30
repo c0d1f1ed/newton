@@ -168,7 +168,11 @@ class Example:
         self._collide(self.state_0, self.frame_dt)
 
         self.graph = None
-        if newton.examples._can_capture_gpu(wp.get_device()):
+        # WebGPU conditionals use eager host readback; conditional graph
+        # recording remains unavailable. The scheduler itself is unchanged.
+        if newton.examples._can_capture_gpu(wp.get_device()) and not (
+            getattr(self.model.device, "is_webgpu", False) and self.use_scheduler
+        ):
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph

@@ -191,7 +191,13 @@ class Example:
 
     def capture(self):
         self.graph = None
-        if newton.examples._can_capture_gpu(self.device) and not wp.config.verify_cuda:
+        # Preserve the configured conditional PADMM loop through eager
+        # WebGPU predicate readback until conditional recording is supported.
+        if (
+            newton.examples._can_capture_gpu(self.device)
+            and not wp.config.verify_cuda
+            and not (getattr(self.device, "is_webgpu", False) and self.config.padmm.use_graph_conditionals)
+        ):
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
