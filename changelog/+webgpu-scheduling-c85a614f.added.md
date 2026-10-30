@@ -1,0 +1,1 @@
+Select existing fixed solver schedules automatically for MuJoCo Warp and Kamino PADMM on WebGPU, with explicit overrides and unchanged CPU/CUDA defaults, and preserve Kamino sorting sentinels without native snippets.

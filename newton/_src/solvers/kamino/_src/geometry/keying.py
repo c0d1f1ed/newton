@@ -205,8 +205,10 @@ def binary_search_find_range_start(
     return left
 
 
-@wp.func_native("""return 0x7FFFFFFFFFFFFFFFull;""")
-def uint64_sentinel_value() -> wp.uint64: ...
+@wp.func
+def uint64_sentinel_value() -> wp.uint64:
+    """Return the largest signed 64-bit value as an unsigned sorting sentinel."""
+    return (wp.uint64(0x7FFFFFFF) << wp.uint64(32)) | wp.uint64(0xFFFFFFFF)
 
 
 ###

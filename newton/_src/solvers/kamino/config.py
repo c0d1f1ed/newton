@@ -583,11 +583,12 @@ class PADMMSolverConfig:
     Defaults to `True`.
     """
 
-    use_graph_conditionals: bool = True
+    use_graph_conditionals: bool | None = None
     """
     Enables use of CUDA graph conditional nodes in iterative solvers.\n
     If `False`, replaces `wp.capture_while` with unrolled for-loops over max iterations.\n
-    Defaults to `True`.
+    If ``None``, disable conditional scheduling on WebGPU and enable it on CPU and CUDA.
+    Explicit Boolean values override automatic selection.
     """
 
     warmstart_mode: Literal["none", "internal", "containers"] = "containers"

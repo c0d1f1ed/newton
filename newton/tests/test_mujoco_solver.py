@@ -142,6 +142,11 @@ class TestMuJoCoSolver(unittest.TestCase):
             places=5,
             msg=f"ls_tolerance should be {custom_ls_tolerance}",
         )
+        self.assertEqual(solver.mjw_model.opt.graph_conditional, not getattr(model.device, "is_webgpu", False))
+        for graph_conditional in (False, True):
+            with self.subTest(graph_conditional=graph_conditional):
+                configured_solver = SolverMuJoCo(model, graph_conditional=graph_conditional)
+                self.assertEqual(configured_solver.mjw_model.opt.graph_conditional, graph_conditional)
 
 
 class _MuJoCoSolverPropertiesFixture:

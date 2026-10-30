@@ -422,6 +422,10 @@ class TestKeySorter(unittest.TestCase):
         # Verify results
         sorted_keys_np = sorter.sorted_keys.numpy()[:num_active_keys_const]
         sorted_to_unsorted_map_np = sorter.sorted_to_unsorted_map.numpy()[:num_active_keys_const]
+        np.testing.assert_array_equal(
+            sorter.sorted_keys.numpy()[num_active_keys_const:max_num_keys],
+            np.full(max_num_keys - num_active_keys_const, make_bitmask(63), dtype=np.uint64),
+        )
         msg.info("sorter.sorted_keys: %s", sorted_keys_np)
         msg.info("sorter.sorted_to_unsorted_map: %s", sorted_to_unsorted_map_np)
         for i in range(num_active_keys_const):

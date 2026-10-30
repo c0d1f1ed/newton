@@ -280,6 +280,9 @@ class PADMMSolver:
         )
         tile_size = get_tile_size(self._size.max_of_max_total_cts)
         block_dim = get_block_dim(tile_size, ratio=2, min_size=1)
+        if getattr(self._device, "is_webgpu", False):
+            block_dim = 1
+        self._project_dual_convergence_block_dim = block_dim
         self._project_dual_convergence_accel_kernel = _make_project_dual_convergence_accel_kernel(block_dim)
 
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
@@ -1159,12 +1162,10 @@ class PADMMSolver:
 
     def _update_projection_dual_convergence_accel(self, problem: DualProblem):
         """Advance accelerated PADMM projection, residual status, and state cache."""
-        tile_size = get_tile_size(self._size.max_of_max_total_cts)
-        block_dim = get_block_dim(tile_size, ratio=2, min_size=1)
         wp.launch_tiled(
             kernel=self._project_dual_convergence_accel_kernel,
             dim=self._size.num_worlds,
-            block_dim=block_dim,
+            block_dim=self._project_dual_convergence_block_dim,
             inputs=[
                 # Inputs:
                 problem.data.dim,
@@ -1222,6 +1223,8 @@ class PADMMSolver:
         # Compute infinity-norm of all residuals and check for convergence
         tile_size = get_tile_size(self._size.max_of_max_total_cts)
         block_dim = get_block_dim(tile_size, min_size=1)
+        if getattr(self._device, "is_webgpu", False):
+            block_dim = 1
         wp.launch_tiled(
             kernel=_make_compute_infnorm_residuals_kernel(
                 tile_size,

@@ -398,6 +398,7 @@ class TestSolverKaminoConfig(unittest.TestCase):
         self.assertEqual(config.dynamics.linear_solver_type, "LLTB")
         self.assertEqual(config.padmm.warmstart_mode, "containers")
         self.assertEqual(config.padmm.warmstart_scale, 0.9)
+        self.assertIsNone(config.padmm.use_graph_conditionals)
 
     def test_01_make_explicit(self):
         """Construct an explicit solver configuration with requested overrides."""
@@ -976,9 +977,20 @@ class TestSolverKaminoImpl(unittest.TestCase):
         """
         builder = build_boxes_fourbar()
         model = ModelKamino.from_newton(builder.finalize(device=self.default_device))
-        solver = SolverKaminoImpl(model=model)
-        self.assertIsInstance(solver, SolverKaminoImpl)
-        assert_solver_components(self, solver)
+        for use_graph_conditionals in (None, False, True):
+            with self.subTest(use_graph_conditionals=use_graph_conditionals):
+                config = SolverKaminoImpl.Config(
+                    padmm=kamino_config.PADMMSolverConfig(use_graph_conditionals=use_graph_conditionals)
+                )
+                solver = SolverKaminoImpl(model=model, config=config)
+                self.assertIsInstance(solver, SolverKaminoImpl)
+                assert_solver_components(self, solver)
+                expected = (
+                    not getattr(model.device, "is_webgpu", False)
+                    if use_graph_conditionals is None
+                    else use_graph_conditionals
+                )
+                self.assertEqual(solver._solver_fd._use_graph_conditionals, expected)
 
     def test_02_make_default_valid_with_limits_and_with_contacts(self):
         """

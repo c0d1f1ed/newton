@@ -4397,6 +4397,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         nconmax: int | None = None,
         iterations: int | None = None,
         ls_iterations: int | None = None,
+        graph_conditional: bool | None = None,
         ccd_iterations: int | None = None,
         sdf_iterations: int | None = None,
         sdf_initpoints: int | None = None,
@@ -4459,6 +4460,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 from the export with a warning.
             iterations: Number of solver iterations. If None, uses model custom attribute or MuJoCo's default (100).
             ls_iterations: Number of line search iterations for the solver. If None, uses model custom attribute or MuJoCo's default (50).
+            graph_conditional: Whether MuJoCo Warp uses conditional graphs for solver iterations. If None, use fixed scheduling on WebGPU and retain the provider default on CPU and CUDA. Explicit values override automatic selection. Fixed scheduling retains iteration limits and convergence masks.
             ccd_iterations: Maximum CCD iterations. If None, uses model custom attribute or MuJoCo's default (35).
             sdf_iterations: Maximum SDF iterations. If None, uses model custom attribute or MuJoCo's default (10).
             sdf_initpoints: Number of SDF initialization points. If None, uses model custom attribute or MuJoCo's default (40).
@@ -4896,6 +4898,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         if self.mjw_model is not None:
             self.mjw_model.opt.run_collision_detection = use_mujoco_contacts
+            if graph_conditional is not None:
+                self.mjw_model.opt.graph_conditional = graph_conditional
+            elif getattr(model.device, "is_webgpu", False):
+                self.mjw_model.opt.graph_conditional = False
         if use_speculative_contacts:
             if self.mjw_model.opt.integrator not in (
                 mujoco.mjtIntegrator.mjINT_EULER,

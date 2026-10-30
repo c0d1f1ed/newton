@@ -208,8 +208,11 @@ class SolverKaminoImpl(SolverBase):
 
         # If graph conditionals are disabled in the PADMM solver, ensure that they
         # are also disabled in the linear solver if it is an iterative solver.
+        use_graph_conditionals = self._config.padmm.use_graph_conditionals
+        if use_graph_conditionals is None:
+            use_graph_conditionals = not getattr(self._model.device, "is_webgpu", False)
         linear_solver_kwargs = dict(self._config.dynamics.linear_solver_kwargs)
-        if not self._config.padmm.use_graph_conditionals and issubclass(linear_solver_type, IterativeSolver):
+        if not use_graph_conditionals and issubclass(linear_solver_type, IterativeSolver):
             linear_solver_kwargs.setdefault("use_graph_conditionals", False)
 
         # Bundle both constraint stabilization and forward-
@@ -281,7 +284,7 @@ class SolverKaminoImpl(SolverBase):
                 config=self._config.padmm,
                 warmstart=self._warmstart_mode,
                 use_acceleration=self._config.padmm.use_acceleration,
-                use_graph_conditionals=self._config.padmm.use_graph_conditionals,
+                use_graph_conditionals=use_graph_conditionals,
                 collect_info=self._config.collect_solver_info,
             )
         elif self._config.dynamics_solver == "dvi":
