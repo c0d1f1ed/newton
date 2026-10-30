@@ -2055,8 +2055,8 @@ class ViewerGL(ViewerBase):
         Retrieve the last rendered frame.
 
         This method uses OpenGL Pixel Buffer Objects (PBO). CUDA viewers use
-        CUDA-OpenGL interoperability, while CPU viewers read the PBO into host
-        memory.
+        CUDA-OpenGL interoperability. Other devices read the PBO into host
+        memory before transferring it to the viewer device.
 
         .. deprecated:: 1.7
             ``target_image`` and passing optional arguments positionally are
@@ -2129,7 +2129,7 @@ class ViewerGL(ViewerBase):
         if not self.device.is_cuda:
             shape = (w * h * 3,)
             if self._pbo_host_buffer is None or self._pbo_host_buffer.shape != shape:
-                self._pbo_host_buffer = wp.empty(shape=shape, dtype=wp.uint8, device=self.device)
+                self._pbo_host_buffer = wp.empty(shape=shape, dtype=wp.uint8, device="cpu")
             gl.glGetBufferSubData(
                 gl.GL_PIXEL_PACK_BUFFER,
                 0,
@@ -2146,6 +2146,8 @@ class ViewerGL(ViewerBase):
         else:
             assert self._pbo_host_buffer is not None
             buf = self._pbo_host_buffer
+            if not self.device.is_cpu:
+                buf = buf.to(self.device)
 
         if output is None:
             output = wp.empty(

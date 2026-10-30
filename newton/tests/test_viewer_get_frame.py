@@ -632,6 +632,70 @@ class TestViewerGLGetFrame(unittest.TestCase):
         self.assertEqual(frame.device, wp.get_device("cpu"))
         self.assertEqual(fake_gl.readback_count, 5)
 
+    def test_non_cuda_viewer_stages_readback_in_host_memory(self):
+        """Keep GL writes on the host before transfer to another non-CUDA device."""
+        pixels = np.arange(12, dtype=np.uint8)
+        fake_gl = _FakeGL(pixels)
+        device = SimpleNamespace(is_cpu=False, is_cuda=False)
+        viewer = ViewerGL.__new__(ViewerGL)
+        viewer._rendering_paused = False
+        viewer.device = device
+        viewer.renderer = SimpleNamespace(_screen_width=2, _screen_height=2, _frame_fbo=3)
+        viewer.gui = None
+        viewer._pbo = viewer._wp_pbo = viewer._pbo_host_buffer = None
+        host_staging = []
+        transferred = []
+        empty = wp.empty
+        launch = wp.launch
+        write_pixels = fake_gl.glGetBufferSubData
+
+        def allocate(*args, **kwargs):
+            if len(kwargs["shape"]) == 1:
+                self.assertEqual(kwargs["device"], "cpu", "GL readback requires writable host memory")
+                result = empty(*args, **kwargs)
+                host_staging.append(result)
+                return result
+            self.assertIs(kwargs["device"], device)
+            return empty(*args, **{**kwargs, "device": "cpu"})
+
+        def transfer(source, destination):
+            self.assertIs(source, host_staging[0])
+            self.assertIs(destination, device)
+            result = empty(shape=source.shape, dtype=source.dtype, device="cpu")
+            wp.copy(result, source)
+            transferred.append(result)
+            return result
+
+        def read_pixels(target, offset, size, pointer):
+            self.assertEqual(pointer, host_staging[0].ptr)
+            write_pixels(target, offset, size, pointer)
+
+        def flip_frame(kernel, *, dim, inputs, outputs, device):
+            self.assertIs(device, viewer.device)
+            self.assertIs(inputs[0], transferred[-1])
+            launch(kernel, dim=dim, inputs=inputs, outputs=outputs, device="cpu")
+
+        # CPU stand-ins exercise transfer ordering without creating a GL
+        # context or initializing another device. The GL writer uses real
+        # writable host memory, and the unchanged flip kernel runs on CPU.
+        with (
+            mock.patch.object(RendererGL, "gl", fake_gl),
+            mock.patch.object(fake_gl, "glGetBufferSubData", side_effect=read_pixels),
+            mock.patch.object(wp, "empty", side_effect=allocate),
+            mock.patch.object(wp.array, "to", autospec=True, side_effect=transfer),
+            mock.patch.object(wp, "launch", side_effect=flip_frame),
+            mock.patch.object(wp, "RegisteredGLBuffer", side_effect=AssertionError("Unexpected CUDA interop")),
+        ):
+            frame = viewer.get_frame()
+            output = empty(shape=frame.shape, dtype=wp.uint8, device="cpu")
+            self.assertIs(viewer.get_frame(output=output), output)
+        np.testing.assert_array_equal(frame.numpy(), pixels.reshape(2, 2, 3)[::-1])
+        np.testing.assert_array_equal(output.numpy(), frame.numpy())
+        self.assertTrue(viewer._pbo_host_buffer.device.is_cpu)
+        self.assertEqual(len(host_staging), 1)
+        self.assertEqual(len(transferred), 2)
+        self.assertEqual(fake_gl.readback_count, 2)
+
     def test_texture_affine_transform_matches_authored_coordinates(self):
         """Apply a UsdTransform2d affine mapping exactly once before GL sampling."""
         viewer = _make_headless_viewer_gl_or_skip(self, width=320, height=240)
