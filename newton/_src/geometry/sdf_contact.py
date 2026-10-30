@@ -274,6 +274,10 @@ def compute_mesh_boundary_flags(mesh: wp.Mesh) -> np.ndarray:
     open edge. Vertices match by exact position, so seams with duplicated
     vertex indices stay shared without welding nearby geometry.
 
+    This static metadata preprocessing already reads the mesh on the host.
+    For WebGPU meshes, the coverage sweep uses a temporary CPU mesh to retain
+    its double-precision collinearity tests.
+
     Args:
         mesh: Finalized Warp mesh whose BVH resolves split seams.
 
@@ -304,13 +308,19 @@ def compute_mesh_boundary_flags(mesh: wp.Mesh) -> np.ndarray:
     if len(candidates) > 0:
         slot = first_slot[candidates]
         candidate_edges = faces[(slot // 3)[:, None], opposite[slot % 3]]
-        boundary = wp.zeros(len(candidates), dtype=wp.int32, device=mesh.device)
+        query_mesh = mesh
+        if getattr(mesh.device, "is_webgpu", False):
+            query_mesh = wp.Mesh(
+                points=wp.array(points, dtype=wp.vec3, device="cpu"),
+                indices=wp.array(faces.reshape(-1), dtype=wp.int32, device="cpu"),
+            )
+        boundary = wp.zeros(len(candidates), dtype=wp.int32, device=query_mesh.device)
         wp.launch(
             _mesh_edge_boundary_kernel,
             dim=len(candidates),
-            inputs=[mesh.id, wp.array(candidate_edges, dtype=wp.vec2i, device=mesh.device)],
+            inputs=[query_mesh.id, wp.array(candidate_edges, dtype=wp.vec2i, device=query_mesh.device)],
             outputs=[boundary],
-            device=mesh.device,
+            device=query_mesh.device,
         )
         open_edge[candidates] = boundary.numpy() != 0
     open_vertex = np.zeros(position_count, dtype=bool)

@@ -1302,6 +1302,26 @@ def test_bounded_mesh_sdf_sign(test, device):
             rotated_points = [wp.quat_rotate(rotation, wp.vec3(p)) for p in points]
             rotated_gradients = [wp.quat_rotate(rotation, wp.vec3(g)) for g in expected_gradients]
             mesh = _make_warp_mesh(vertices, faces, device)
+            mesh_id, mesh_points, mesh_indices = mesh.id, mesh.points, mesh.indices
+            boundary_flags = compute_mesh_boundary_flags(mesh)
+            test.assertEqual(mesh.id, mesh_id)
+            test.assertIs(mesh.points, mesh_points)
+            test.assertIs(mesh.indices, mesh_indices)
+            np.testing.assert_array_equal(mesh.points.numpy().view(np.uint32), vertices.view(np.uint32))
+            np.testing.assert_array_equal(mesh.indices.numpy().reshape(-1, 3), faces)
+            if getattr(mesh.device, "is_webgpu", False):
+                reference_mesh = _make_warp_mesh(vertices, faces, "cpu")
+                np.testing.assert_array_equal(boundary_flags, compute_mesh_boundary_flags(reference_mesh))
+            # Signed zeros denote the same positions, including at duplicated
+            # vertices and T-junctions. Metadata must not alter the input mesh.
+            signed_zero_vertices = vertices.copy()
+            zero_indices = np.flatnonzero(signed_zero_vertices.reshape(-1) == 0.0)
+            signed_zero_vertices.reshape(-1)[zero_indices[::2]] = -0.0
+            signed_zero_mesh = _make_warp_mesh(signed_zero_vertices, faces, device)
+            np.testing.assert_array_equal(boundary_flags, compute_mesh_boundary_flags(signed_zero_mesh))
+            np.testing.assert_array_equal(
+                signed_zero_mesh.points.numpy().view(np.uint32), signed_zero_vertices.view(np.uint32)
+            )
             values = wp.empty((len(points), 2), dtype=float, device=device)
             gradients = wp.empty(len(points), dtype=wp.vec3, device=device)
             wp.launch(
@@ -1311,7 +1331,7 @@ def test_bounded_mesh_sdf_sign(test, device):
                     mesh.id,
                     wp.array(rotated_points, dtype=wp.vec3, device=device),
                     int(sign_method),
-                    wp.array(compute_mesh_boundary_flags(mesh), dtype=wp.uint8, device=device),
+                    wp.array(boundary_flags, dtype=wp.uint8, device=device),
                     values,
                     gradients,
                 ],
