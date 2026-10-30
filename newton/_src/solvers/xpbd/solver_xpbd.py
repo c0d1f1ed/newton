@@ -41,7 +41,10 @@ from .restitution_kernels import (
     RESTITUTION_MANIFOLD_MAX_CONTACTS,
     apply_restitution_deltas,
     build_restitution_manifolds,
+    insert_restitution_manifolds,
     mark_restitution_contacts,
+    prepare_restitution_contacts,
+    publish_restitution_manifold_keys,
     select_manifold_contacts,
     solve_manifold_restitution,
 )
@@ -1365,43 +1368,97 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
                     # pairs, so contacts are not pair-contiguous; a fixed-size
                     # hash table built with atomics keeps this graph-capture
                     # safe.
-                    wp.launch(
-                        kernel=build_restitution_manifolds,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[
-                            body_q_pre_solve,
-                            body_qd_pre_solve,
-                            model.body_com,
-                            self.body_inv_mass_effective,
-                            self.body_inv_inertia_effective,
-                            model.body_world,
-                            model.shape_body,
-                            contacts.rigid_contact_count,
-                            restitution_contact_active,
-                            contacts.rigid_contact_normal,
-                            contacts.rigid_contact_shape0,
-                            contacts.rigid_contact_shape1,
-                            model.shape_material_restitution,
-                            contacts.rigid_contact_point0,
-                            contacts.rigid_contact_point1,
-                            contacts.rigid_contact_offset0,
-                            contacts.rigid_contact_offset1,
-                            model.gravity,
-                            dt,
-                            model.body_count,
-                        ],
-                        outputs=[
-                            restitution_manifold_key,
-                            restitution_manifold_head,
-                            restitution_manifold_total,
-                            restitution_contact_next,
-                            restitution_contact_n_K,
-                            restitution_contact_axn_lo_target,
-                            restitution_contact_axn_hi_sigma,
-                            restitution_contact_pos_depth,
-                        ],
-                        device=model.device,
-                    )
+                    if getattr(model.device, "is_webgpu", False):
+                        # Keys are immutable before CAS32 publication. Queue boundaries
+                        # preserve complete keys without emulating a 64-bit transaction.
+                        candidate_key = wp.empty(contacts.rigid_contact_max, dtype=wp.int64, device=model.device)
+                        slot_owner = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
+                        wp.launch(
+                            kernel=prepare_restitution_contacts,
+                            dim=contacts.rigid_contact_max,
+                            inputs=[
+                                body_q_pre_solve,
+                                body_qd_pre_solve,
+                                model.body_com,
+                                self.body_inv_mass_effective,
+                                self.body_inv_inertia_effective,
+                                model.body_world,
+                                model.shape_body,
+                                contacts.rigid_contact_count,
+                                restitution_contact_active,
+                                contacts.rigid_contact_normal,
+                                contacts.rigid_contact_shape0,
+                                contacts.rigid_contact_shape1,
+                                model.shape_material_restitution,
+                                contacts.rigid_contact_point0,
+                                contacts.rigid_contact_point1,
+                                contacts.rigid_contact_offset0,
+                                contacts.rigid_contact_offset1,
+                                model.gravity,
+                                dt,
+                                model.body_count,
+                            ],
+                            outputs=[
+                                candidate_key,
+                                restitution_contact_n_K,
+                                restitution_contact_axn_lo_target,
+                                restitution_contact_axn_hi_sigma,
+                                restitution_contact_pos_depth,
+                            ],
+                            device=model.device,
+                        )
+                        wp.launch(
+                            kernel=insert_restitution_manifolds,
+                            dim=contacts.rigid_contact_max,
+                            inputs=[candidate_key, slot_owner],
+                            outputs=[restitution_manifold_head, restitution_manifold_total, restitution_contact_next],
+                            device=model.device,
+                        )
+                        wp.launch(
+                            kernel=publish_restitution_manifold_keys,
+                            dim=contacts.rigid_contact_max,
+                            inputs=[candidate_key, slot_owner],
+                            outputs=[restitution_manifold_key],
+                            device=model.device,
+                        )
+                    else:
+                        wp.launch(
+                            kernel=build_restitution_manifolds,
+                            dim=contacts.rigid_contact_max,
+                            inputs=[
+                                body_q_pre_solve,
+                                body_qd_pre_solve,
+                                model.body_com,
+                                self.body_inv_mass_effective,
+                                self.body_inv_inertia_effective,
+                                model.body_world,
+                                model.shape_body,
+                                contacts.rigid_contact_count,
+                                restitution_contact_active,
+                                contacts.rigid_contact_normal,
+                                contacts.rigid_contact_shape0,
+                                contacts.rigid_contact_shape1,
+                                model.shape_material_restitution,
+                                contacts.rigid_contact_point0,
+                                contacts.rigid_contact_point1,
+                                contacts.rigid_contact_offset0,
+                                contacts.rigid_contact_offset1,
+                                model.gravity,
+                                dt,
+                                model.body_count,
+                            ],
+                            outputs=[
+                                restitution_manifold_key,
+                                restitution_manifold_head,
+                                restitution_manifold_total,
+                                restitution_contact_next,
+                                restitution_contact_n_K,
+                                restitution_contact_axn_lo_target,
+                                restitution_contact_axn_hi_sigma,
+                                restitution_contact_pos_depth,
+                            ],
+                            device=model.device,
+                        )
 
                     # Reduce each manifold chain to its bounded best-K subset
                     # (deterministic; see restitution_kernels.select_manifold_contacts).

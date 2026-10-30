@@ -67,8 +67,9 @@ _restitution_vecNf = wp.types.vector(length=RESTITUTION_MANIFOLD_MAX_CONTACTS, d
 _restitution_vecNi = wp.types.vector(length=RESTITUTION_MANIFOLD_MAX_CONTACTS, dtype=wp.int32)
 
 
-@wp.kernel
-def build_restitution_manifolds(
+@wp.func
+def _prepare_restitution_contact(
+    tid: int,
     body_q_pre_solve: wp.array[wp.transform],
     body_qd_pre_solve: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
@@ -89,57 +90,21 @@ def build_restitution_manifolds(
     gravity: wp.array[wp.vec3],
     dt: float,
     body_count: int,
-    # outputs
-    manifold_key: wp.array[wp.int64],
-    manifold_head: wp.array[wp.int32],
-    manifold_total: wp.array[wp.int32],
-    contact_next: wp.array[wp.int32],
     contact_n_K: wp.array[wp.vec4],
     contact_axn_lo_target: wp.array[wp.vec4],
     contact_axn_hi_sigma: wp.array[wp.vec4],
     contact_pos_depth: wp.array[wp.vec4],
-):
-    """Group contacts that can fire restitution into per-body-pair manifolds.
-
-    The collision pipeline interleaves contacts across pairs, so contacts are
-    not pair-contiguous. Each active contact inserts its canonical body-pair
-    key (``(lo+1)*(body_count+1) + hi+1 >= 1``; 0 means an empty slot) into an
-    open-addressing hash table via ``atomic_cas`` and pushes its contact index
-    onto the slot's uncapped linked chain
-    (``manifold_head``/``contact_next``); :func:`select_manifold_contacts`
-    later reduces each chain to a bounded best-K subset. Fixed-size table, no
-    host sync: CUDA-graph-capture safe.
-
-    Alongside, packed per-contact records consumed by
-    :func:`solve_manifold_restitution` are cached:
-
-    * ``contact_n_K``: contact normal and effective inverse mass
-      ``K = m_inv + (r x n)^T I^-1 (r x n)`` summed over both bodies.
-    * ``contact_axn_lo_target``: ``r_lo x n`` (world) and the restitution
-      target ``-e * rel_vel_old`` for an impact, the anchored separating
-      velocity for an already-separating contact, or zero for a fully
-      inelastic impact.
-    * ``contact_axn_hi_sigma``: ``r_hi x n`` (world) and the normal sign
-      ``sigma`` for the lower-indexed body (-1 when it is the shape0 side),
-      with the resting threshold packed into its magnitude.
-    * ``contact_pos_depth``: world mid-surface contact point and the
-      pre-solve penetration depth (larger = deeper), consumed by the
-      best-K selection.
-
-    Everything derives from pre-solve state, so the grouping and records are
-    valid for all restitution iterations of the current substep.
-    """
-    tid = wp.tid()
-
+) -> wp.int64:
+    """Cache one active contact and return its canonical body-pair key."""
     if tid >= contact_count[0]:
-        return
+        return wp.int64(0)
     if restitution_contact_active[tid] == 0:
-        return
+        return wp.int64(0)
 
     shape_a = contact_shape0[tid]
     shape_b = contact_shape1[tid]
     if shape_a == shape_b:
-        return
+        return wp.int64(0)
     body_a = -1
     body_b = -1
     mat_nonzero = 0
@@ -155,7 +120,7 @@ def build_restitution_manifolds(
     if mat_nonzero > 0:
         restitution /= float(mat_nonzero)
     if body_a == body_b or restitution < 0.0:
-        return
+        return wp.int64(0)
 
     lo = wp.min(body_a, body_b)
     hi = wp.max(body_a, body_b)
@@ -220,7 +185,7 @@ def build_restitution_manifolds(
         rel_vel_old -= sigma * wp.dot(n, velocity_at_point(qd_hi_pre, r_hi))
 
     if inv_mass == 0.0:
-        return
+        return wp.int64(0)
     impact_threshold = 2.0 * gravity_magnitude * dt
     target = 0.0
     if rel_vel_old < -impact_threshold:
@@ -238,7 +203,100 @@ def build_restitution_manifolds(
     depth = sigma * wp.dot(n, bx_hi - bx_lo)
     contact_pos_depth[tid] = wp.vec4(p_mid[0], p_mid[1], p_mid[2], depth)
 
-    key = wp.int64(lo + 1) * wp.int64(body_count + 1) + wp.int64(hi + 1)
+    return wp.int64(lo + 1) * wp.int64(body_count + 1) + wp.int64(hi + 1)
+
+
+@wp.kernel
+def build_restitution_manifolds(
+    body_q_pre_solve: wp.array[wp.transform],
+    body_qd_pre_solve: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    body_m_inv: wp.array[float],
+    body_I_inv: wp.array[wp.mat33],
+    body_world: wp.array[wp.int32],
+    shape_body: wp.array[int],
+    contact_count: wp.array[int],
+    restitution_contact_active: wp.array[wp.int32],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    shape_material_restitution: wp.array[float],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_offset0: wp.array[wp.vec3],
+    contact_offset1: wp.array[wp.vec3],
+    gravity: wp.array[wp.vec3],
+    dt: float,
+    body_count: int,
+    manifold_key: wp.array[wp.int64],
+    manifold_head: wp.array[wp.int32],
+    manifold_total: wp.array[wp.int32],
+    contact_next: wp.array[wp.int32],
+    contact_n_K: wp.array[wp.vec4],
+    contact_axn_lo_target: wp.array[wp.vec4],
+    contact_axn_hi_sigma: wp.array[wp.vec4],
+    contact_pos_depth: wp.array[wp.vec4],
+):
+    """Group contacts that can fire restitution into per-body-pair manifolds.
+
+    The collision pipeline interleaves contacts across pairs, so contacts are
+    not pair-contiguous. Each active contact inserts its canonical body-pair
+    key (``(lo+1)*(body_count+1) + hi+1 >= 1``; 0 means an empty slot) into an
+    open-addressing hash table via ``atomic_cas`` and pushes its contact index
+    onto the slot's uncapped linked chain
+    (``manifold_head``/``contact_next``); :func:`select_manifold_contacts`
+    later reduces each chain to a bounded best-K subset. Fixed-size table, no
+    host sync: CUDA-graph-capture safe.
+
+    Alongside, packed per-contact records consumed by
+    :func:`solve_manifold_restitution` are cached:
+
+    * ``contact_n_K``: contact normal and effective inverse mass
+      ``K = m_inv + (r x n)^T I^-1 (r x n)`` summed over both bodies.
+    * ``contact_axn_lo_target``: ``r_lo x n`` (world) and the restitution
+      target ``-e * rel_vel_old`` for an impact, the anchored separating
+      velocity for an already-separating contact, or zero for a fully
+      inelastic impact.
+    * ``contact_axn_hi_sigma``: ``r_hi x n`` (world) and the normal sign
+      ``sigma`` for the lower-indexed body (-1 when it is the shape0 side),
+      with the resting threshold packed into its magnitude.
+    * ``contact_pos_depth``: world mid-surface contact point and the
+      pre-solve penetration depth (larger = deeper), consumed by the
+      best-K selection.
+
+    Everything derives from pre-solve state, so the grouping and records are
+    valid for all restitution iterations of the current substep.
+    """
+    tid = wp.tid()
+    key = _prepare_restitution_contact(
+        tid,
+        body_q_pre_solve,
+        body_qd_pre_solve,
+        body_com,
+        body_m_inv,
+        body_I_inv,
+        body_world,
+        shape_body,
+        contact_count,
+        restitution_contact_active,
+        contact_normal,
+        contact_shape0,
+        contact_shape1,
+        shape_material_restitution,
+        contact_point0,
+        contact_point1,
+        contact_offset0,
+        contact_offset1,
+        gravity,
+        dt,
+        body_count,
+        contact_n_K,
+        contact_axn_lo_target,
+        contact_axn_hi_sigma,
+        contact_pos_depth,
+    )
+    if key == wp.int64(0):
+        return
     table_size = manifold_key.shape[0]
     slot = wp.int32(key % wp.int64(table_size))
     # linear probing; table capacity >= contact capacity so a slot always exists
@@ -252,6 +310,110 @@ def build_restitution_manifolds(
         slot += 1
         if slot == table_size:
             slot = 0
+
+
+@wp.kernel
+def prepare_restitution_contacts(
+    body_q_pre_solve: wp.array[wp.transform],
+    body_qd_pre_solve: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    body_m_inv: wp.array[float],
+    body_I_inv: wp.array[wp.mat33],
+    body_world: wp.array[wp.int32],
+    shape_body: wp.array[int],
+    contact_count: wp.array[int],
+    restitution_contact_active: wp.array[wp.int32],
+    contact_normal: wp.array[wp.vec3],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    shape_material_restitution: wp.array[float],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_offset0: wp.array[wp.vec3],
+    contact_offset1: wp.array[wp.vec3],
+    gravity: wp.array[wp.vec3],
+    dt: float,
+    body_count: int,
+    candidate_key: wp.array[wp.int64],
+    contact_n_K: wp.array[wp.vec4],
+    contact_axn_lo_target: wp.array[wp.vec4],
+    contact_axn_hi_sigma: wp.array[wp.vec4],
+    contact_pos_depth: wp.array[wp.vec4],
+):
+    """Write immutable contact keys before portable hash publication."""
+    tid = wp.tid()
+    key = _prepare_restitution_contact(
+        tid,
+        body_q_pre_solve,
+        body_qd_pre_solve,
+        body_com,
+        body_m_inv,
+        body_I_inv,
+        body_world,
+        shape_body,
+        contact_count,
+        restitution_contact_active,
+        contact_normal,
+        contact_shape0,
+        contact_shape1,
+        shape_material_restitution,
+        contact_point0,
+        contact_point1,
+        contact_offset0,
+        contact_offset1,
+        gravity,
+        dt,
+        body_count,
+        contact_n_K,
+        contact_axn_lo_target,
+        contact_axn_hi_sigma,
+        contact_pos_depth,
+    )
+    candidate_key[tid] = key
+
+
+@wp.kernel(enable_backward=False)
+def insert_restitution_manifolds(
+    candidate_key: wp.array[wp.int64],
+    slot_owner: wp.array[wp.int32],
+    manifold_head: wp.array[wp.int32],
+    manifold_total: wp.array[wp.int32],
+    contact_next: wp.array[wp.int32],
+):
+    """Publish contact indices with CAS32, comparing immutable complete keys."""
+    tid = wp.tid()
+    key = candidate_key[tid]
+    if key == wp.int64(0):
+        return
+    table_size = slot_owner.shape[0]
+    slot = wp.int32(key % wp.int64(table_size))
+    for _attempt in range(table_size):
+        previous = wp.atomic_cas(slot_owner, slot, 0, tid + 1)
+        matches = previous == 0
+        if previous > 0:
+            matches = candidate_key[previous - 1] == key
+        if matches:
+            wp.atomic_add(manifold_total, slot, 1)
+            contact_next[tid] = wp.atomic_exch(manifold_head, slot, tid + 1) - 1
+            return
+        slot += 1
+        if slot == table_size:
+            slot = 0
+
+
+@wp.kernel(enable_backward=False)
+def publish_restitution_manifold_keys(
+    candidate_key: wp.array[wp.int64],
+    slot_owner: wp.array[wp.int32],
+    manifold_key: wp.array[wp.int64],
+):
+    """Materialize full keys after all slot owners have been published."""
+    tid = wp.tid()
+    key = wp.int64(0)
+    owner = slot_owner[tid]
+    if owner > 0:
+        key = candidate_key[owner - 1]
+    manifold_key[tid] = key
 
 
 @wp.kernel

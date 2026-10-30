@@ -1,0 +1,1 @@
+Support XPBD rigid restitution on WebGPU with dispatch-ordered contact records and immutable full-width keys published through 32-bit contact indices, preserving manifold selection and solve behavior.

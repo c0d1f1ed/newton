@@ -7,6 +7,7 @@ Tests for the XPBD solver.
 Includes tests for particle-particle friction using relative velocity correctly.
 """
 
+import tempfile
 import unittest
 import warnings
 from unittest import mock
@@ -17,6 +18,7 @@ import warp as wp
 import newton
 import newton.examples
 from newton._src.solvers.xpbd import kernels as xpbd_kernels
+from newton._src.solvers.xpbd import restitution_kernels
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
@@ -2655,6 +2657,151 @@ def test_xpbd_mimic_warns_for_unsupported_joint_types(test, device):
     test.assertIn(f"unsupported follower joint indices: {followers[:10]}; 2 additional indices omitted.", message)
 
 
+@wp.kernel
+def restitution_target_loss(target: wp.array[wp.vec4], loss: wp.array[float]):
+    loss[0] = target[0][3]
+
+
+def test_rigid_restitution_record_gradients(test, device):
+    """Differentiate a smooth impact target through the shared contact records."""
+    for portable in (True,) if getattr(device, "is_webgpu", False) else (False, True):
+        with test.subTest(portable=portable):
+            velocity = wp.array(
+                [[0.0, 0.0, -4.0, 0.0, 0.0, 0.0]], dtype=wp.spatial_vector, device=device, requires_grad=True
+            )
+            zero = wp.zeros(1, dtype=wp.vec3, device=device)
+            zero_int = wp.zeros(1, dtype=int, device=device)
+            one_int = wp.ones(1, dtype=int, device=device)
+            inputs = [
+                wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+                velocity,
+                zero,
+                wp.ones(1, dtype=float, device=device),
+                wp.array([wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)], dtype=wp.mat33, device=device),
+                zero_int,
+                wp.array([0, -1], dtype=int, device=device),
+                one_int,
+                one_int,
+                wp.array([[0.0, 0.0, -1.0]], dtype=wp.vec3, device=device),
+                zero_int,
+                one_int,
+                wp.full(2, 0.5, dtype=float, device=device),
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+                1.0 / 60.0,
+                1,
+            ]
+            records = [wp.zeros(1, dtype=wp.vec4, device=device, requires_grad=True) for _ in range(4)]
+            outputs = [wp.zeros(1, dtype=wp.int64, device=device)]
+            if not portable:
+                outputs += [wp.zeros(1, dtype=int, device=device) for _ in range(3)]
+            outputs += records
+            kernel = (
+                restitution_kernels.prepare_restitution_contacts
+                if portable
+                else restitution_kernels.build_restitution_manifolds
+            )
+            loss = wp.zeros(1, dtype=float, device=device, requires_grad=True)
+            with wp.Tape() as tape:
+                wp.launch(kernel, dim=1, inputs=inputs, outputs=outputs, device=device)
+                wp.launch(restitution_target_loss, dim=1, inputs=[records[1]], outputs=[loss], device=device)
+            tape.backward(loss=loss)
+            # A zero-offset normal impact has target=-e*v_z; e=0.5.
+            np.testing.assert_allclose(loss.numpy(), [2.0], atol=1.0e-6, rtol=1.0e-6)
+            np.testing.assert_allclose(
+                velocity.grad.numpy(), [[0.0, 0.0, -0.5, 0.0, 0.0, 0.0]], atol=1.0e-6, rtol=1.0e-6
+            )
+
+
+def test_rigid_restitution_manifold_publication(test, device):
+    """Preserve complete colliding keys, chains, and resets through APIC replay."""
+    size = 97
+    # All nonzero keys collide at the initial slot. Equal low words do not
+    # imply equal full keys; repeated contacts still share one chain.
+    keys = np.array(
+        [1 + size * (2**32) * i for i in range(1, 31)] + [1 + size * (2**32)] * 31 + [0] * 36,
+        dtype=np.int64,
+    )
+    test.assertEqual(len(keys), size)
+    candidate = wp.array(keys, dtype=wp.int64, device=device)
+    owner = wp.zeros(size, dtype=wp.int32, device=device)
+    head = wp.zeros_like(owner)
+    total = wp.zeros_like(owner)
+    following = wp.empty_like(owner)
+    table = wp.empty(size, dtype=wp.int64, device=device)
+    arrays = {"owner": owner, "head": head, "total": total, "following": following, "table": table}
+
+    def publish():
+        owner.zero_()
+        head.zero_()
+        total.zero_()
+        following.fill_(-99)
+        table.fill_(-99)
+        wp.launch(
+            restitution_kernels.insert_restitution_manifolds,
+            dim=size,
+            inputs=[candidate, owner, head, total, following],
+            device=device,
+        )
+        wp.launch(
+            restitution_kernels.publish_restitution_manifold_keys,
+            dim=size,
+            inputs=[candidate, owner, table],
+            device=device,
+        )
+
+    def verify(values, expected):
+        raw = {name: value.numpy() for name, value in values.items()}
+        expected_groups = {int(key): set(np.flatnonzero(expected == key)) for key in expected if key != 0}
+        test.assertEqual(set(map(int, raw["table"])) - {0}, set(expected_groups))
+        test.assertEqual(int(np.sum(raw["total"])), np.count_nonzero(expected))
+        visited = set()
+        for slot, key in enumerate(raw["table"]):
+            if key == 0:
+                test.assertEqual(raw["owner"][slot], 0)
+                test.assertEqual(raw["head"][slot], 0)
+                test.assertEqual(raw["total"][slot], 0)
+                continue
+            test.assertEqual(expected[raw["owner"][slot] - 1], key)
+            chain = set()
+            contact = int(raw["head"][slot]) - 1
+            while contact >= 0:
+                test.assertLess(contact, size)
+                test.assertNotIn(contact, chain)
+                test.assertNotIn(contact, visited)
+                chain.add(contact)
+                visited.add(contact)
+                contact = int(raw["following"][contact])
+            test.assertEqual(chain, expected_groups.pop(int(key)))
+            test.assertEqual(len(chain), raw["total"][slot])
+        test.assertFalse(expected_groups)
+
+    publish()
+    verify(arrays, keys)
+    with wp.ScopedCapture(device=device, apic=True) as capture:
+        publish()
+    full_table = np.array([1 + size * (2**32) * i for i in range(1, size + 1)], dtype=np.int64)
+    for expected in (np.roll(keys, 17), np.zeros_like(keys), full_table, keys):
+        candidate.assign(expected)
+        wp.capture_launch(capture.graph)
+        verify(arrays, expected)
+    with tempfile.TemporaryDirectory() as directory:
+        path = f"{directory}/restitution"
+        wp.capture_save(capture.graph, path, inputs={"candidate": candidate}, outputs=arrays)
+        loaded = wp.capture_load(path, device=device)
+    expected = np.roll(keys, 43)
+    candidate.assign(expected)
+    loaded.set_param("candidate", candidate)
+    wp.capture_launch(loaded)
+    restored = {name: wp.empty_like(value) for name, value in arrays.items()}
+    for name, value in restored.items():
+        loaded.get_param(name, value)
+    verify(restored, expected)
+
+
 devices = get_test_devices()
 
 
@@ -3036,6 +3183,23 @@ add_function_test(
     TestSolverXPBD,
     "test_xpbd_mimic_warns_for_unsupported_joint_types",
     test_xpbd_mimic_warns_for_unsupported_joint_types,
+    devices=devices,
+    check_output=False,
+)
+
+
+add_function_test(
+    TestSolverXPBD,
+    "test_rigid_restitution_record_gradients",
+    test_rigid_restitution_record_gradients,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBD,
+    "test_rigid_restitution_manifold_publication",
+    test_rigid_restitution_manifold_publication,
     devices=devices,
     check_output=False,
 )
