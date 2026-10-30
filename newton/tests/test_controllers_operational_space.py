@@ -16,7 +16,9 @@ helper hides nothing beyond boilerplate.
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 import warp as wp
@@ -26,9 +28,11 @@ from newton._src.controllers.impl._common import (
     _make_invert_spd_block_kernel,
     _null_space_projector_kernel,
     _pose_error_kernel,
+    _read_port,
     _shift_jacobian_to_tool_kernel,
     _SPDInverse,
     _task_matrix_times_jacobian_kernel,
+    _write_port,
 )
 from newton._src.controllers.impl.operational_space._common import (
     _apply_generalized_task_specification_matrix_kernel,
@@ -225,7 +229,7 @@ def test_spd_inverse_heterogeneous_strided_blocks_and_replay(test, device):
     """Match NumPy for mixed block sizes and preserve padding across repeated inversions.
 
     Exercise small and large matrices, strided submatrix views used by partial
-    inertia decoupling, empty blocks, and CUDA capture of the first launch.
+    inertia decoupling, empty blocks, and GPU capture of the first launch.
     """
     rng = np.random.default_rng(4302)
     for max_dim in (3, 6, 7, 10, 11, 30):
@@ -247,8 +251,11 @@ def test_spd_inverse_heterogeneous_strided_blocks_and_replay(test, device):
             operation = _SPDInverse(len(block_sizes), max_dim, wp.get_device(device))
             matrix_view = matrix[:, 1:-1, 1:-1]
             inverse_view = inverse[:, 1:-1, 1:-1]
-            if wp.get_device(device).is_cuda:
-                with wp.ScopedCapture(device=device) as capture:
+            gpu_capture = wp.get_device(device).is_cuda or getattr(wp.get_device(device), "is_webgpu", False)
+            if gpu_capture:
+                with wp.ScopedCapture(
+                    device=device, apic=getattr(wp.get_device(device), "is_webgpu", False)
+                ) as capture:
                     operation.launch(matrix_view, block_dim, inverse_view)
                 wp.capture_launch(capture.graph)
             else:
@@ -259,11 +266,99 @@ def test_spd_inverse_heterogeneous_strided_blocks_and_replay(test, device):
             matrix.assign(matrix_np * 2.0)
             for block_idx, n in enumerate(block_sizes):
                 expected[block_idx, 1 : n + 1, 1 : n + 1] *= 0.5
-            if wp.get_device(device).is_cuda:
+            if gpu_capture:
                 wp.capture_launch(capture.graph)
             else:
                 operation.launch(matrix_view, block_dim, inverse_view)
             np.testing.assert_allclose(inverse.numpy(), expected, atol=1e-6, rtol=1e-5)
+            if getattr(wp.get_device(device), "is_webgpu", False) and max_dim == 6:
+                with tempfile.TemporaryDirectory() as directory:
+                    path = str(Path(directory) / "inverse.wrp")
+                    wp.capture_save(capture.graph, path, outputs={"inverse": inverse})
+                    restored = wp.capture_load(path, device=device)
+                wp.capture_launch(restored)
+                result = wp.empty_like(inverse)
+                restored.get_param("inverse", result)
+                np.testing.assert_allclose(result.numpy(), expected, atol=1e-6, rtol=1e-5)
+
+
+def test_indexed_controller_ports_gapped_views_and_replay(test, device):
+    """Gather live composite ports and scatter through gapped output aliases."""
+    device = wp.get_device(device)
+    selection = np.array([4, 1, 4, 0], dtype=np.int32)
+    for dtype, width in ((wp.float32, 1), (wp.transform, 7), (wp.spatial_vector, 6), (wp.quat, 4)):
+        with test.subTest(dtype=dtype):
+            values = np.arange(12 * width, dtype=np.float32)
+            if width > 1:
+                values = values.reshape(12, width)
+            backing = wp.array(values, dtype=dtype, device=device)
+            indices = wp.array(selection, dtype=int, device=device)
+            port = backing[1::2][indices]
+            buffer = wp.empty(4, dtype=dtype, device=device)
+            _read_port(port, buffer, 4, device)
+            np.testing.assert_array_equal(buffer.numpy(), values[1::2][selection])
+
+            target = wp.full(14, -11.0, dtype=float, device=device)
+            output_indices = wp.array([4, 1, 0, 3], dtype=int, device=device)
+            output_port = target[1::2][output_indices]
+            if dtype == wp.float32:
+                _write_port(output_port, buffer, 4, device)
+            gpu_capture = device.is_cuda or getattr(device, "is_webgpu", False)
+            if gpu_capture:
+                with wp.ScopedCapture(device=device, apic=getattr(device, "is_webgpu", False)) as capture:
+                    _read_port(port, buffer, 4, device)
+                    if dtype == wp.float32:
+                        _write_port(output_port, buffer, 4, device)
+                wp.capture_launch(capture.graph)
+            values += 100.0
+            backing.assign(values)
+            target.fill_(-11.0)
+            if gpu_capture:
+                wp.capture_launch(capture.graph)
+            else:
+                _read_port(port, buffer, 4, device)
+                if dtype == wp.float32:
+                    _write_port(output_port, buffer, 4, device)
+            expected = values[1::2][selection]
+            np.testing.assert_array_equal(buffer.numpy(), expected)
+            if dtype == wp.float32:
+                written = np.full(14, -11.0, dtype=np.float32)
+                written[1 + 2 * np.array([4, 1, 0, 3])] = expected
+                np.testing.assert_array_equal(target.numpy(), written)
+                if getattr(device, "is_webgpu", False):
+                    with tempfile.TemporaryDirectory() as directory:
+                        path = str(Path(directory) / "ports.wrp")
+                        wp.capture_save(capture.graph, path, outputs={"gathered": buffer, "written": target})
+                        restored = wp.capture_load(path, device=device)
+                    wp.capture_launch(restored)
+                    result = wp.empty_like(buffer)
+                    restored.get_param("gathered", result)
+                    np.testing.assert_array_equal(result.numpy(), expected)
+                    output = wp.empty_like(target)
+                    restored.get_param("written", output)
+                    np.testing.assert_array_equal(output.numpy(), written)
+
+    matrix_values = np.arange(5 * 4 * 6, dtype=np.float32).reshape(5, 4, 6)
+    matrices = wp.array(matrix_values, device=device)
+    robots = wp.array([3, 1], dtype=int, device=device)
+    matrix_port = matrices[:, ::2, 1::2][robots]
+    matrix_buffer = wp.empty(matrix_port.shape, device=device)
+    _read_port(matrix_port, matrix_buffer, matrix_port.shape, device)
+    if device.is_cuda or getattr(device, "is_webgpu", False):
+        with wp.ScopedCapture(device=device, apic=getattr(device, "is_webgpu", False)) as capture:
+            _read_port(matrix_port, matrix_buffer, matrix_port.shape, device)
+        wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(matrix_buffer.numpy(), matrix_values[[3, 1], ::2, 1::2])
+
+    if getattr(device, "is_webgpu", False):
+        for source_grad, buffer_grad in ((True, False), (False, True)):
+            with test.subTest(source_grad=source_grad, buffer_grad=buffer_grad):
+                backing = wp.zeros(8, device=device, requires_grad=source_grad)
+                port = backing[wp.array([1, 3], dtype=int, device=device)]
+                buffer = wp.empty(2, device=device, requires_grad=buffer_grad)
+                for operation in (_read_port, _write_port):
+                    with test.assertRaisesRegex(NotImplementedError, "indexed controller ports.*gradients"):
+                        operation(port, buffer, 2, device)
 
 
 def test_jacobian_tool_shift_matches_twist(test, device):
@@ -710,6 +805,12 @@ class TestOperationalSpaceKernels(unittest.TestCase):
     pass
 
 
+add_function_test(
+    TestOperationalSpaceKernels,
+    "test_indexed_controller_ports_gapped_views_and_replay",
+    test_indexed_controller_ports_gapped_views_and_replay,
+    devices=devices,
+)
 add_function_test(
     TestOperationalSpaceKernels,
     "test_spd_inverse_heterogeneous_strided_blocks_and_replay",

@@ -324,7 +324,7 @@ class _SPDInverse:
     block so a few high-DOF robots do not impose a large local-memory frame on
     every column thread. CPU inversions factor once and solve every column on
     one thread per block in the same launch, avoiding redundant factorization
-    work and a second launch.
+    work and a second launch. WebGPU uses the same serial-column schedule.
     """
 
     def __init__(self, block_count: int, max_dim: int, device: wp.context.Device):
@@ -333,7 +333,7 @@ class _SPDInverse:
         self._column_count = max_dim if device.is_cuda else 1
         self._factor_once = device.is_cuda and max_dim > 10
         self._kernel = _make_invert_spd_block_kernel(
-            max_dim, factor_only=self._factor_once, serial_columns=device.is_cpu
+            max_dim, factor_only=self._factor_once, serial_columns=not device.is_cuda
         )
         self._factor = (
             wp.empty((block_count, max_dim, max_dim), dtype=float, device=device) if self._factor_once else None
@@ -481,9 +481,10 @@ def _gather_mass_matrix_blocks_kernel(
     ]
 
 
-# wp.copy is not recordable under APIC graph capture when either side is
-# non-contiguous, which every indexed-view port is. These two kernels do the
-# same work in a form that captures and serialises. Controllers launch them
+# CPU/CUDA wp.copy is not recordable under APIC graph capture when either
+# side is non-contiguous, which every indexed-view port is. These kernels do
+# the same work in a form that captures and serialises. WebGPU records its
+# indexed copies directly as memory commands. Controllers launch the kernels
 # at their own port length: one entry per controlled DOF for a compact port, one
 # per model coordinate or DOF for a model-based controller's whole-model ports.
 
@@ -576,6 +577,18 @@ def _port_destination(port: wp.array | wp.indexedarray, buffer: wp.array) -> wp.
     return buffer if isinstance(port, wp.indexedarray) else port
 
 
+def _copy_indexed_port(port: wp.indexedarray, buffer: wp.array, *, to_port: bool) -> None:
+    """Copy a WebGPU indexed port through recordable memory commands."""
+    # IndexedArray has no gradient view for wp.copy to record. A kernel
+    # adjoint would need scatter-add for repeated source indices.
+    if port.data.requires_grad or buffer.requires_grad:
+        raise NotImplementedError("WebGPU indexed controller ports do not support gradients")
+    if to_port:
+        wp.copy(port, buffer)
+    else:
+        wp.copy(buffer, port)
+
+
 def _write_port(
     port: wp.array | wp.indexedarray,
     buffer: wp.array,
@@ -591,7 +604,12 @@ def _write_port(
         device: Device to launch on.
     """
     if isinstance(port, wp.indexedarray):
-        wp.launch(_scatter_port_kernel, dim=shape, inputs=[buffer], outputs=[port], device=device)
+        if getattr(wp.get_device(device), "is_webgpu", False):
+            if port.dtype != wp.float32 or port.ndim != 1:
+                raise TypeError("Indexed controller output ports require a 1-D Float32 array")
+            _copy_indexed_port(port, buffer, to_port=True)
+        else:
+            wp.launch(_scatter_port_kernel, dim=shape, inputs=[buffer], outputs=[port], device=device)
 
 
 def _read_port(
@@ -602,9 +620,9 @@ def _read_port(
 ) -> None:
     """Copy a bound port into an internal buffer, whatever it is bound to.
 
-    A view has to go through a kernel: :func:`warp.copy` is not recordable under
-    APIC graph capture when either side is non-contiguous, so using it here would
-    make a controller that reports ``is_graphable()`` fail to export.
+    CPU/CUDA views go through a kernel because non-contiguous :func:`warp.copy`
+    cannot be recorded under APIC graph capture on those backends. WebGPU
+    records indexed copies directly and requires non-differentiable ports.
 
     Args:
         port: The caller-bound port, a :class:`warp.array` or a view of one.
@@ -629,4 +647,7 @@ def _read_port(
             f"_read_port has no gather kernel for a {port.ndim}-D indexed array of dtype {port.dtype}; "
             f"add one to _GATHER_KERNELS_BY_DTYPE_AND_RANK in controllers/impl/_common.py."
         )
+    if getattr(wp.get_device(device), "is_webgpu", False):
+        _copy_indexed_port(port, buffer, to_port=False)
+        return
     wp.launch(kernel, dim=shape, inputs=[port], outputs=[buffer], device=device)
