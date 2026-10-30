@@ -1,0 +1,1 @@
+Route Style3D PCG inner products on WebGPU through the array reduction service with owner-retaining scalar output views, preserving captured replay and keeping opaque WebGPU addresses out of the native CUDA reduction entry point.

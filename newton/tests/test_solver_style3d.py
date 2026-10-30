@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
+import tempfile
 import unittest
 from unittest import mock
 
@@ -9,6 +11,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.style3d.builder import PDMatrixBuilder, _compute_max_neighbors
+from newton._src.solvers.style3d.linear_solver import PcgSolver, array_inner
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
@@ -295,7 +298,89 @@ def test_global_particles_use_global_gravity(test, device):
     test.assertTrue(np.all(state_1.particle_qd.numpy()[:, 2] < -1.0e-6))
 
 
+def test_pcg_inner_product_output_views(test, device):
+    """Write only the selected Float32 PCG scalar without losing its owner."""
+    count = 17
+    a = np.arange(count * 3, dtype=np.float32).reshape(count, 3)
+    b = np.flip(a, axis=0).copy()
+    expected = np.sum(a * b, dtype=np.float32)
+    solver = PcgSolver(count, device=device, maxIter=5)
+    solver.r.assign(a)
+    solver.z.assign(b)
+    solver.p.assign(b)
+    solver.Ap.assign(a)
+    solver.rTz.fill_(-17.0)
+    solver.pTAp.fill_(-19.0)
+    solver.step3_update_rTz(2)
+    solver.step6_update_pTAp(3)
+    reference = np.full(5, -17.0, dtype=np.float32)
+    reference[2] = expected
+    np.testing.assert_array_equal(solver.rTz.numpy(), reference)
+    reference.fill(-19.0)
+    reference[3] = expected
+    np.testing.assert_array_equal(solver.pTAp.numpy(), reference)
+    parent = wp.full(9, -23.0, dtype=float, device=device)
+    strided = parent[1::2]
+    output = strided[2:3]
+    array_inner(solver.r, solver.z, output)
+    reference = np.full(9, -23.0, dtype=np.float32)
+    reference[5] = expected
+    np.testing.assert_array_equal(parent.numpy(), reference)
+    test.assertEqual(output.dtype, wp.float32)
+    test.assertEqual(output.shape, (1,))
+    test.assertEqual(output.strides, (8,))
+    solver.r.fill_(wp.vec3(1.0))
+    solver.z.fill_(wp.vec3(-2.0))
+    solver.step3_update_rTz(2)
+    reference = np.full(5, -17.0, dtype=np.float32)
+    reference[2] = -6.0 * count
+    np.testing.assert_array_equal(solver.rTz.numpy(), reference)
+
+
+def test_pcg_inner_product_capture_ownership(test, device):
+    """Replay scalar reductions and retain GPU input owners through APIC reload."""
+    count = 17
+    data = np.arange(count * 3, dtype=np.float32).reshape(count, 3)
+    a = wp.array(data, dtype=wp.vec3, device=device)
+    b = wp.full(count, wp.vec3(2.0), dtype=wp.vec3, device=device)
+    parent = wp.full(9, -29.0, dtype=float, device=device)
+    output = parent[1::2][2:3]
+    with wp.ScopedCapture(device=device, apic=True) as capture:
+        parent.fill_(-29.0)
+        array_inner(a, b, output)
+    expected = np.full(9, -29.0, dtype=np.float32)
+    expected[5] = np.sum(data * np.float32(2.0), dtype=np.float32)
+    if getattr(wp.get_device(device), "is_webgpu", False):
+        # Native CPU/CUDA paths keep their existing raw-entry lifecycle; the
+        # new backend path must independently retain these ordinary Array owners.
+        del a, b, output
+        gc.collect()
+    pressure = wp.full(count, wp.vec3(-31.0), dtype=wp.vec3, device=device)
+    for _ in range(2):
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(parent.numpy(), expected)
+    with tempfile.TemporaryDirectory() as directory:
+        path = f"{directory}/pcg_inner"
+        wp.capture_save(capture.graph, path, outputs={"result": parent})
+        loaded = wp.capture_load(path, device=device)
+    wp.capture_launch(loaded)
+    restored = wp.empty_like(parent)
+    loaded.get_param("result", restored)
+    np.testing.assert_array_equal(restored.numpy(), expected)
+    np.testing.assert_array_equal(pressure.numpy(), np.full((count, 3), -31.0, dtype=np.float32))
+
+
 devices = get_test_devices()
+
+add_function_test(
+    TestSolverStyle3D, "test_pcg_inner_product_output_views", test_pcg_inner_product_output_views, devices=devices
+)
+add_function_test(
+    TestSolverStyle3D,
+    "test_pcg_inner_product_capture_ownership",
+    test_pcg_inner_product_capture_ownership,
+    devices=devices,
+)
 
 
 add_function_test(
