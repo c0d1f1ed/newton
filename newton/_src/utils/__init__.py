@@ -27,10 +27,12 @@ def is_graph_capture_allocation_enabled(device) -> bool:
 
     CUDA needs its stream-ordered memory pool active so that
     ``cudaMallocAsync`` can be captured as a memory-alloc node in the graph;
-    for CPU the concept does not apply -- plain host allocation is always
-    safe during CPU graph capture -- so this always returns ``True`` for CPU
-    devices. Solvers that grow internal buffers on demand should call this
-    before raising a "cannot allocate during capture" error.
+    CPU and WebGPU APIC capture retain their allocations directly, so both
+    always return ``True`` without a CUDA memory pool. Solvers that grow
+    internal buffers on demand should call this before raising a "cannot
+    allocate during capture" error. Initialization operations recorded during
+    capture still execute on every replay, so persistent history must be
+    allocated before capture.
 
     Args:
         device: A Warp device or device identifier.
@@ -40,7 +42,7 @@ def is_graph_capture_allocation_enabled(device) -> bool:
         ``device``; ``False`` otherwise.
     """
     device = wp.get_device(device)
-    if device.is_cpu:
+    if device.is_cpu or getattr(device, "is_webgpu", False):
         return True
     return device.is_mempool_enabled
 

@@ -73,6 +73,7 @@ from newton._src.solvers.vbd.solver_vbd import (
     _is_tet_only_elasticity_model,
     _select_rigid_block_dim,
 )
+from newton._src.utils import is_graph_capture_allocation_enabled
 from newton.solvers.experimental.coupled import SolverCoupledProxy
 from newton.tests.unittest_utils import (
     add_function_test,
@@ -1704,6 +1705,47 @@ def _rigid_contact_history_capture_requires_preallocation(test, device):
     with wp.ScopedCapture(device=device) as capture:
         solver.step(state_out, state_in, control, contacts, 1.0e-3)
     test.assertIsNotNone(capture.graph)
+
+
+def _contact_state_capture_allocation_lifetime(test, device):
+    """Retain lazily allocated contact scratch through replay and APIC save/load."""
+    import tempfile  # noqa: PLC0415
+
+    device = wp.get_device(device)
+    enabled = is_graph_capture_allocation_enabled(device)
+    if not device.is_cuda:
+        test.assertTrue(enabled)
+    solver = SimpleNamespace(device=device)
+    if not enabled:
+        with wp.ScopedCapture(device=device):
+            with test.assertRaisesRegex(RuntimeError, "allocation during capture is not enabled"):
+                newton.solvers.SolverVBD._raise_if_capturing_resize(solver, "body-body contact state", 0, 17)
+        return
+
+    with wp.ScopedCapture(device=device, apic=True) as capture:
+        for name in ("body-body contact state", "body-particle contact state", "rigid contact output"):
+            newton.solvers.SolverVBD._raise_if_capturing_resize(solver, name, 0, 17)
+        scratch = wp.full(17, 3.0, device=device)
+        output = wp.empty_like(scratch)
+        wp.copy(output, scratch)
+    del scratch
+    gc.collect()
+    pressure = wp.full(257, -11.0, device=device)
+    for _ in range(2):
+        output.zero_()
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(output.numpy(), np.full(17, 3.0))
+    with tempfile.TemporaryDirectory() as directory:
+        path = f"{directory}/contact_scratch.wrp"
+        wp.capture_save(capture.graph, path, outputs={"output": output})
+        restored = wp.capture_load(path, device=device)
+    del capture, output
+    gc.collect()
+    wp.capture_launch(restored)
+    result = wp.empty(17, device=device)
+    restored.get_param("output", result)
+    np.testing.assert_array_equal(result.numpy(), np.full(17, 3.0))
+    np.testing.assert_array_equal(pressure.numpy(), np.full(257, -11.0))
 
 
 def _rigid_contact_stick_eps_are_deprecated(test, device):
@@ -6157,6 +6199,12 @@ add_function_test(
     TestSolverVBD,
     "test_rigid_contact_structural_support_conditions_tangent_rho",
     _rigid_contact_structural_support_conditions_tangent_rho,
+    devices=devices,
+)
+add_function_test(
+    TestSolverVBD,
+    "test_contact_state_capture_allocation_lifetime",
+    _contact_state_capture_allocation_lifetime,
     devices=devices,
 )
 add_function_test(

@@ -286,7 +286,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         ``enable_rigid_soft_full_surface_contact`` edge/face headroom. Both grow from
         ``Contacts`` on the first :meth:`step`, and the rigid contact force outputs grow in
         :meth:`collect_rigid_contact_forces`. During graph capture,
-        ordinary lazy resizing is supported on CPU and on CUDA with Warp's
+        ordinary lazy resizing is supported on CPU and WebGPU, and on CUDA with Warp's
         stream-ordered memory pool enabled; otherwise the solver raises with
         guidance to pre-size before capture. Rigid contact history is
         cross-replay-persistent state, so it must always be allocated before
